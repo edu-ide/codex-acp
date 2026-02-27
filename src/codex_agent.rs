@@ -2,6 +2,7 @@ use agent_client_protocol::{
     Agent, AgentCapabilities, AuthMethod, AuthMethodId, AuthenticateRequest, AuthenticateResponse,
     CancelNotification, ClientCapabilities, Error, Implementation, InitializeRequest,
     InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
+    Meta,
     LoadSessionResponse, McpCapabilities, McpServer, McpServerHttp, McpServerStdio,
     NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
     ProtocolVersion, SessionCapabilities, SessionId, SessionInfo, SessionListCapabilities,
@@ -27,7 +28,7 @@ use std::{
     rc::Rc,
     sync::{Arc, Mutex},
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
@@ -264,7 +265,8 @@ impl Agent for CodexAgent {
 
         match auth_method {
             CodexAuthMethod::ChatGpt => {
-                // Perform browser/device login via codex-rs, then report success/failure to the client.
+                // Start browser OAuth login server and return immediately with auth URL metadata.
+                // Desktop client can open this URL and poll newSession until authentication completes.
                 let opts = codex_login::ServerOptions::new(
                     self.config.codex_home.clone(),
                     codex_core::auth::CLIENT_ID.to_string(),
@@ -274,13 +276,36 @@ impl Agent for CodexAgent {
 
                 let server =
                     codex_login::run_login_server(opts).map_err(Error::into_internal_error)?;
+                let auth_url = server.auth_url.clone();
+                let auth_manager = self.auth_manager.clone();
 
-                server
-                    .block_until_done()
-                    .await
-                    .map_err(Error::into_internal_error)?;
+                tokio::spawn(async move {
+                    match server.block_until_done().await {
+                        Ok(()) => {
+                            auth_manager.reload();
+                        }
+                        Err(err) => warn!("ChatGPT OAuth login did not complete: {err}"),
+                    }
+                });
 
-                self.auth_manager.reload();
+                return Ok(AuthenticateResponse::new().meta(Meta::from_iter([
+                    (
+                        "status".to_string(),
+                        serde_json::Value::String("pending".to_string()),
+                    ),
+                    (
+                        "flow".to_string(),
+                        serde_json::Value::String("chatgpt_oauth".to_string()),
+                    ),
+                    (
+                        "authUrl".to_string(),
+                        serde_json::Value::String(auth_url.clone()),
+                    ),
+                    (
+                        "auth_url".to_string(),
+                        serde_json::Value::String(auth_url),
+                    ),
+                ])));
             }
             CodexAuthMethod::CodexApiKey => {
                 let api_key = read_codex_api_key_from_env().ok_or_else(|| {
@@ -548,6 +573,20 @@ impl Agent for CodexAgent {
         let config_options = thread.config_options().await?;
 
         Ok(SetSessionConfigOptionResponse::new(config_options))
+    }
+
+    async fn fork_session(
+        &self,
+        _request: agent_client_protocol::ForkSessionRequest,
+    ) -> Result<agent_client_protocol::ForkSessionResponse, Error> {
+        Err(Error::method_not_found().data("Not Implemented: session/fork is not yet supported"))
+    }
+
+    async fn resume_session(
+        &self,
+        _request: agent_client_protocol::ResumeSessionRequest,
+    ) -> Result<agent_client_protocol::ResumeSessionResponse, Error> {
+        Err(Error::method_not_found().data("Not Implemented: session/resume is not yet supported"))
     }
 }
 
