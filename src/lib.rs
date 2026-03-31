@@ -18,7 +18,47 @@ mod thread;
 
 pub static ACP_CLIENT: OnceLock<Arc<AgentSideConnection>> = OnceLock::new();
 
-/// Run the Codex ACP agent.
+use tokio::io::{AsyncRead, AsyncWrite};
+
+/// Run the Codex ACP agent using arbitrary async streams.
+/// This allows embedding the agent into other processes (like ilhae-proxy).
+pub async fn run_stream<R, W>(
+    config: Config,
+    reader: R,
+    writer: W,
+) -> IoResult<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    // Create our Agent implementation
+    let agent = Rc::new(codex_agent::CodexAgent::new(config));
+
+    let compat_reader = reader.compat();
+    let compat_writer = writer.compat_write();
+
+    // Run the I/O task to handle the actual communication
+    LocalSet::new()
+        .run_until(async move {
+            // Create the ACP connection
+            let (client, io_task) = AgentSideConnection::new(agent.clone(), compat_writer, compat_reader, |fut| {
+                tokio::task::spawn_local(fut);
+            });
+
+            if ACP_CLIENT.set(Arc::new(client)).is_err() {
+                // Ignore if it was already set (e.g. multi-tenant execution)
+            }
+
+            io_task
+                .await
+                .map_err(|e| std::io::Error::other(format!("ACP I/O error: {e}")))
+        })
+        .await?;
+
+    Ok(())
+}
+
+/// Run the Codex ACP agent over stdio (CLI binary usage).
 ///
 /// This sets up an ACP agent that communicates over stdio, bridging
 /// the ACP protocol with the existing codex-rs infrastructure.
@@ -60,31 +100,10 @@ pub async fn run_main(
                 )
             })?;
 
-    // Create our Agent implementation with notification channel
-    let agent = Rc::new(codex_agent::CodexAgent::new(config));
+    let stdin = tokio::io::stdin();
+    let stdout = tokio::io::stdout();
 
-    let stdin = tokio::io::stdin().compat();
-    let stdout = tokio::io::stdout().compat_write();
-
-    // Run the I/O task to handle the actual communication
-    LocalSet::new()
-        .run_until(async move {
-            // Create the ACP connection
-            let (client, io_task) = AgentSideConnection::new(agent.clone(), stdout, stdin, |fut| {
-                tokio::task::spawn_local(fut);
-            });
-
-            if ACP_CLIENT.set(Arc::new(client)).is_err() {
-                return Err(std::io::Error::other("ACP client already set"));
-            }
-
-            io_task
-                .await
-                .map_err(|e| std::io::Error::other(format!("ACP I/O error: {e}")))
-        })
-        .await?;
-
-    Ok(())
+    run_stream(config, stdin, stdout).await
 }
 
 // Re-export the MCP server types for compatibility
