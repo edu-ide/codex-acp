@@ -4,15 +4,14 @@ use agent_client_protocol::{
     ClientCapabilities, CloseSessionRequest, CloseSessionResponse, Error, Implementation,
     InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
     LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer, McpServerHttp,
-    McpServerStdio, NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest,
+    McpServerStdio, Meta, NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest,
     PromptResponse, ProtocolVersion, SessionCapabilities, SessionCloseCapabilities, SessionId,
     SessionInfo, SessionListCapabilities, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
-    SetSessionModelRequest, SetSessionModelResponse, Meta,
+    SetSessionModelRequest, SetSessionModelResponse,
 };
 use codex_core::{
     CodexAuth, NewThread, RolloutRecorder, ThreadManager, ThreadSortKey,
-    auth::{AuthManager, read_codex_api_key_from_env, read_openai_api_key_from_env},
     config::{
         Config,
         types::{McpServerConfig, McpServerTransportConfig},
@@ -21,7 +20,10 @@ use codex_core::{
     models_manager::collaboration_mode_presets::CollaborationModesConfig,
     parse_cursor,
 };
+use codex_exec_server::EnvironmentManager;
 use codex_login::{CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR};
+use codex_login::auth::read_codex_api_key_from_env;
+use codex_login::{AuthManager, read_openai_api_key_from_env};
 use codex_protocol::{
     ThreadId,
     protocol::{InitialHistory, SessionSource},
@@ -36,10 +38,7 @@ use std::{
 use tracing::{debug, info, warn};
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::{
-    local_spawner::{AcpFs, LocalSpawner},
-    thread::Thread,
-};
+use crate::thread::Thread;
 
 /// The Codex implementation of the ACP Agent trait.
 ///
@@ -54,10 +53,7 @@ pub struct CodexAgent {
     config: Config,
     /// Thread manager for handling sessions
     thread_manager: ThreadManager,
-    /// Active sessions mapped by `SessionId`
-    sessions: Rc<RefCell<HashMap<SessionId, Rc<Thread>>>>,
-    /// Session working directories for filesystem sandboxing
-    session_roots: Arc<Mutex<HashMap<SessionId, PathBuf>>>,
+    sessions: RefCell<HashMap<SessionId, Rc<Thread>>>,
 }
 
 const SESSION_LIST_PAGE_SIZE: usize = 25;
@@ -74,11 +70,8 @@ impl CodexAgent {
 
         let client_capabilities: Arc<Mutex<ClientCapabilities>> = Arc::default();
 
-        let local_spawner = LocalSpawner::new();
-        let capabilities_clone = client_capabilities.clone();
-        let session_roots: Arc<Mutex<HashMap<SessionId, PathBuf>>> = Arc::default();
-        let session_roots_clone = session_roots.clone();
-        let thread_manager = ThreadManager::new_with_fs(
+        let environment_manager = Arc::new(EnvironmentManager::new(None));
+        let thread_manager = ThreadManager::new(
             &config,
             auth_manager.clone(),
             SessionSource::Unknown,
@@ -86,22 +79,14 @@ impl CodexAgent {
                 // False for now
                 default_mode_request_user_input: false,
             },
-            Box::new(move |thread_id| {
-                Arc::new(AcpFs::new(
-                    Self::session_id_from_thread_id(thread_id),
-                    capabilities_clone.clone(),
-                    local_spawner.clone(),
-                    session_roots_clone.clone(),
-                ))
-            }),
+            environment_manager,
         );
         Self {
             auth_manager,
             client_capabilities,
             config,
             thread_manager,
-            sessions: Rc::default(),
-            session_roots,
+            sessions: RefCell::default(),
         }
     }
 
@@ -134,7 +119,7 @@ impl CodexAgent {
     ) -> Result<Config, Error> {
         let mut config = self.config.clone();
         config.include_apply_patch_tool = true;
-        config.cwd.clone_from(cwd);
+        config.cwd = cwd.clone().try_into().map_err(|_e| Error::internal_error())?;
 
         // Propagate any client-provided MCP servers that codex-rs supports.
         let mut new_mcp_servers = config.mcp_servers.get().clone();
@@ -166,6 +151,7 @@ impl CodexAgent {
                             tool_timeout_sec: None,
                             disabled_tools: None,
                             enabled_tools: None,
+                            tools: std::collections::HashMap::new(),
                             disabled_reason: None,
                             scopes: None,
                             oauth_resource: None,
@@ -201,6 +187,7 @@ impl CodexAgent {
                             tool_timeout_sec: None,
                             disabled_tools: None,
                             enabled_tools: None,
+                            tools: std::collections::HashMap::new(),
                             disabled_reason: None,
                             scopes: None,
                             oauth_resource: None,
@@ -317,10 +304,7 @@ impl Agent for CodexAgent {
                         "authUrl".to_string(),
                         serde_json::Value::String(auth_url.clone()),
                     ),
-                    (
-                        "auth_url".to_string(),
-                        serde_json::Value::String(auth_url),
-                    ),
+                    ("auth_url".to_string(), serde_json::Value::String(auth_url)),
                 ])));
             }
             CodexAuthMethod::CodexApiKey => {
@@ -373,11 +357,6 @@ impl Agent for CodexAgent {
             .map_err(|_e| Error::internal_error())?;
 
         let session_id = Self::session_id_from_thread_id(thread_id);
-        // Record the session root for filesystem sandboxing.
-        self.session_roots
-            .lock()
-            .unwrap()
-            .insert(session_id.clone(), config.cwd.clone());
         let thread = Rc::new(Thread::new(
             session_id.clone(),
             thread,
@@ -441,6 +420,7 @@ impl Agent for CodexAgent {
             config.clone(),
             rollout_path,
             self.auth_manager.clone(),
+            None,
         ))
         .await
         .map_err(|e| Error::internal_error().data(e.to_string()))?;
@@ -458,10 +438,6 @@ impl Agent for CodexAgent {
 
         let load = thread.load().await?;
 
-        self.session_roots
-            .lock()
-            .unwrap()
-            .insert(session_id.clone(), config.cwd);
         self.sessions.borrow_mut().insert(session_id, thread);
 
         Ok(LoadSessionResponse::new()
@@ -544,10 +520,6 @@ impl Agent for CodexAgent {
             )
             .await;
         self.sessions.borrow_mut().remove(&request.session_id);
-        self.session_roots
-            .lock()
-            .unwrap()
-            .remove(&request.session_id);
         Ok(CloseSessionResponse::new())
     }
 

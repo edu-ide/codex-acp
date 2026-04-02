@@ -1,6 +1,6 @@
 {
   "name": "@zed-industries/${PACKAGE_NAME}",
-  "version": "${VERSION}",
+  "version": "0.0.0",
   "description": "An ACP-compatible coding agent powered by Codex - ${OS} ${ARCH} binary",
   "license": "Apache-2.0",
   "author": "Zed <hi@zed.dev>",

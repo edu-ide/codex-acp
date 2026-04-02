@@ -12,8 +12,6 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing_subscriber::EnvFilter;
 
 mod codex_agent;
-mod local_spawner;
-mod prompt_args;
 mod thread;
 
 pub static ACP_CLIENT: OnceLock<Arc<AgentSideConnection>> = OnceLock::new();
@@ -22,11 +20,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Run the Codex ACP agent using arbitrary async streams.
 /// This allows embedding the agent into other processes (like ilhae-proxy).
-pub async fn run_stream<R, W>(
-    config: Config,
-    reader: R,
-    writer: W,
-) -> IoResult<()>
+pub async fn run_stream<R, W>(config: Config, reader: R, writer: W) -> IoResult<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -41,9 +35,10 @@ where
     LocalSet::new()
         .run_until(async move {
             // Create the ACP connection
-            let (client, io_task) = AgentSideConnection::new(agent.clone(), compat_writer, compat_reader, |fut| {
-                tokio::task::spawn_local(fut);
-            });
+            let (client, io_task) =
+                AgentSideConnection::new(agent.clone(), compat_writer, compat_reader, |fut| {
+                    tokio::task::spawn_local(fut);
+                });
 
             if ACP_CLIENT.set(Arc::new(client)).is_err() {
                 // Ignore if it was already set (e.g. multi-tenant execution)
