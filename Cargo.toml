@@ -26,7 +26,9 @@ clap = "4"
 codex-apply-patch = { path = "../codex/codex-rs/apply-patch" }
 codex-arg0 = { path = "../codex/codex-rs/arg0" }
 
+codex-config = { path = "../codex/codex-rs/config" }
 codex-core = { path = "../codex/codex-rs/core" }
+codex-models-manager = { path = "../codex/codex-rs/models-manager" }
 codex-exec-server = { path = "../codex/codex-rs/exec-server" }
 codex-mcp-server = { path = "../codex/codex-rs/mcp-server" }
 codex-protocol = { path = "../codex/codex-rs/protocol" }

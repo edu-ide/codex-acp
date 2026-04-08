@@ -22,13 +22,14 @@ use agent_client_protocol::{
 };
 use codex_apply_patch::parse_patch;
 use codex_core::{
-    AuthManager, CodexThread,
+    CodexThread,
     config::{Config, set_project_trust_level},
-    error::CodexErr,
-    models_manager::manager::{ModelsManager, RefreshStrategy},
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
 };
+use codex_protocol::error::CodexErr;
+use codex_models_manager::manager::{ModelsManager, RefreshStrategy};
+use codex_login::AuthManager;
 use codex_protocol::{
     approvals::{ElicitationRequest, ElicitationRequestEvent},
     config_types::TrustLevel,
@@ -117,7 +118,7 @@ impl Auth for Arc<AuthManager> {
     fn logout(&self) -> Result<bool, Error> {
         self.as_ref()
             .logout()
-            .map_err(|e| Error::internal_error().data(e.to_string()))
+            .map_err(|e: std::io::Error| Error::internal_error().data(e.to_string()))
     }
 }
 

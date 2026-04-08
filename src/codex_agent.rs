@@ -10,18 +10,14 @@ use agent_client_protocol::{
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
     SetSessionModelRequest, SetSessionModelResponse,
 };
+use codex_config::types::{McpServerConfig, McpServerTransportConfig};
 use codex_core::{
-    CodexAuth, NewThread, RolloutRecorder, ThreadManager, ThreadSortKey,
-    config::{
-        Config,
-        types::{McpServerConfig, McpServerTransportConfig},
-    },
-    find_thread_path_by_id_str,
-    models_manager::collaboration_mode_presets::CollaborationModesConfig,
-    parse_cursor,
+    NewThread, RolloutRecorder, ThreadManager, ThreadSortKey, config::Config,
+    find_thread_path_by_id_str, parse_cursor,
 };
+use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_exec_server::EnvironmentManager;
-use codex_login::{CODEX_API_KEY_ENV_VAR, OPENAI_API_KEY_ENV_VAR};
+use codex_login::{CLIENT_ID, CODEX_API_KEY_ENV_VAR, CodexAuth, OPENAI_API_KEY_ENV_VAR};
 use codex_login::auth::read_codex_api_key_from_env;
 use codex_login::{AuthManager, read_openai_api_key_from_env};
 use codex_protocol::{
@@ -38,7 +34,7 @@ use std::{
 use tracing::{debug, info, warn};
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::thread::Thread;
+use crate::thread::{ModelsManagerImpl, Thread};
 
 /// The Codex implementation of the ACP Agent trait.
 ///
@@ -272,7 +268,7 @@ impl Agent for CodexAgent {
                 // Desktop client can open this URL and poll newSession until authentication completes.
                 let opts = codex_login::ServerOptions::new(
                     self.config.codex_home.clone(),
-                    codex_core::auth::CLIENT_ID.to_string(),
+                    CLIENT_ID.to_string(),
                     None,
                     self.config.cli_auth_credentials_store_mode,
                 );
