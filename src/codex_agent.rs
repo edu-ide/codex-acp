@@ -59,7 +59,7 @@ impl CodexAgent {
     /// Create a new `CodexAgent` with the given configuration
     pub fn new(config: Config) -> Self {
         let auth_manager = AuthManager::shared(
-            config.codex_home.clone(),
+            config.codex_home.clone().to_path_buf(),
             false,
             config.cli_auth_credentials_store_mode,
         );
@@ -76,6 +76,7 @@ impl CodexAgent {
                 default_mode_request_user_input: false,
             },
             environment_manager,
+            None,
         );
         Self {
             auth_manager,
@@ -148,9 +149,12 @@ impl CodexAgent {
                             disabled_tools: None,
                             enabled_tools: None,
                             tools: std::collections::HashMap::new(),
+                            experimental_environment: None,
                             disabled_reason: None,
                             scopes: None,
                             oauth_resource: None,
+                            supports_parallel_tool_calls: false,
+                            default_tools_approval_mode: None,
                         },
                     );
                 }
@@ -184,9 +188,12 @@ impl CodexAgent {
                             disabled_tools: None,
                             enabled_tools: None,
                             tools: std::collections::HashMap::new(),
+                            experimental_environment: None,
                             disabled_reason: None,
                             scopes: None,
                             oauth_resource: None,
+                            supports_parallel_tool_calls: false,
+                            default_tools_approval_mode: None,
                         },
                     );
                 }
@@ -267,7 +274,7 @@ impl Agent for CodexAgent {
                 // Start browser OAuth login server and return immediately with auth URL metadata.
                 // Desktop client can open this URL and poll newSession until authentication completes.
                 let opts = codex_login::ServerOptions::new(
-                    self.config.codex_home.clone(),
+                    self.config.codex_home.clone().to_path_buf(),
                     CLIENT_ID.to_string(),
                     None,
                     self.config.cli_auth_credentials_store_mode,
@@ -404,6 +411,7 @@ impl Agent for CodexAgent {
             InitialHistory::Resumed(resumed) => resumed.history.clone(),
             InitialHistory::Forked(items) => items.clone(),
             InitialHistory::New => Vec::new(),
+            InitialHistory::Cleared => Vec::new(),
         };
 
         let config = self.build_session_config(&cwd, mcp_servers)?;

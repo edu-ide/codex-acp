@@ -617,6 +617,7 @@ impl PromptState {
             | EventMsg::McpToolCallEnd(..)
             | EventMsg::ApplyPatchApprovalRequest(..)
             | EventMsg::PatchApplyBegin(..)
+            | EventMsg::PatchApplyUpdated(..)
             | EventMsg::PatchApplyEnd(..)
             | EventMsg::TurnStarted(..)
             | EventMsg::TurnComplete(..)
@@ -635,6 +636,7 @@ impl PromptState {
                 model_context_window,
                 collaboration_mode_kind,
                 turn_id,
+                started_at: _,
             }) => {
                 info!("Task started with context window of {turn_id} {model_context_window:?} {collaboration_mode_kind:?}");
             }
@@ -798,6 +800,7 @@ impl PromptState {
             EventMsg::McpToolCallBegin(McpToolCallBeginEvent {
                 call_id,
                 invocation,
+                ..
             }) => {
                 info!(
                     "MCP tool call begin: call_id={call_id}, invocation={} {}",
@@ -810,6 +813,7 @@ impl PromptState {
                 invocation,
                 duration,
                 result,
+                ..
             }) => {
                 info!(
                     "MCP tool call ended: call_id={call_id}, invocation={} {}, duration={duration:?}",
@@ -835,6 +839,7 @@ impl PromptState {
                 );
                 self.start_patch_apply(client, event).await;
             }
+            EventMsg::PatchApplyUpdated(..) => {}
             EventMsg::PatchApplyEnd(event) => {
                 info!(
                     "Patch apply end: call_id={}, success={}",
@@ -849,7 +854,12 @@ impl PromptState {
             }) => {
                 info!("Item completed: thread_id={}, turn_id={}, item={:?}", thread_id, turn_id, item);
             }
-            EventMsg::TurnComplete(TurnCompleteEvent { last_agent_message, turn_id }) => {
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                last_agent_message,
+                turn_id,
+                completed_at: _,
+                duration_ms: _,
+            }) => {
                 info!(
                     "Task {turn_id} completed successfully after {} events. Last agent message: {last_agent_message:?}",
                     self.event_count
@@ -899,7 +909,12 @@ impl PromptState {
                         .ok();
                 }
             }
-            EventMsg::TurnAborted(TurnAbortedEvent { reason, turn_id }) => {
+            EventMsg::TurnAborted(TurnAbortedEvent {
+                reason,
+                turn_id,
+                completed_at: _,
+                duration_ms: _,
+            }) => {
                 info!("Turn {turn_id:?} aborted: {reason:?}");
                 self.abort_pending_interactions();
                 if let Some(response_tx) = self.response_tx.take() {
@@ -972,6 +987,12 @@ impl PromptState {
                 info!("Context compacted");
                 client.send_agent_text("Context compacted\n".to_string()).await;
             }
+            EventMsg::LoopLifecycleStarted(..)
+            | EventMsg::LoopLifecycleProgress(..)
+            | EventMsg::LoopLifecycleCompleted(..)
+            | EventMsg::LoopLifecycleFailed(..) => {
+                // Loop lifecycle visibility is handled in the TUI/app-server path for now.
+            }
             EventMsg::RequestPermissions(event) => {
                 info!("Request permissions: {} {}", event.call_id, event.turn_id);
                 if let Err(err) = self.request_permissions(client, event).await
@@ -1013,6 +1034,8 @@ impl PromptState {
             | EventMsg::CollabResumeEnd(..)
             | EventMsg::CollabCloseBegin(..)
             | EventMsg::CollabCloseEnd(..)
+            | EventMsg::RealtimeConversationSdp(..)
+            | EventMsg::RealtimeConversationListVoicesResponse(..)
             | EventMsg::PlanDelta(..) => {}
             e @ (EventMsg::McpListToolsResponse(..)
             | EventMsg::ListSkillsResponse(..)
@@ -1900,6 +1923,15 @@ fn build_exec_permission_options(
                 ),
                 decision: ReviewDecision::Abort,
             },
+            ReviewDecision::TimedOut => ExecPermissionOption {
+                option_id: "timed_out",
+                permission_option: PermissionOption::new(
+                    "timed_out",
+                    "Timed Out",
+                    PermissionOptionKind::RejectOnce,
+                ),
+                decision: ReviewDecision::TimedOut,
+            },
         })
         .collect()
 }
@@ -2672,6 +2704,7 @@ impl<A: Auth> ThreadActor<A> {
                             text_elements: vec![],
                         }],
                         final_output_json_schema: None,
+                        responsesapi_client_metadata: None,
                     }
                 }
                 "review" => {
@@ -2722,6 +2755,7 @@ impl<A: Auth> ThreadActor<A> {
                     op = Op::UserInput {
                         items,
                         final_output_json_schema: None,
+                        responsesapi_client_metadata: None,
                     }
                 }
             }
@@ -2729,6 +2763,7 @@ impl<A: Auth> ThreadActor<A> {
             op = Op::UserInput {
                 items,
                 final_output_json_schema: None,
+                responsesapi_client_metadata: None,
             }
         }
 
@@ -2936,7 +2971,7 @@ impl<A: Auth> ThreadActor<A> {
         for hunk in &parsed.hunks {
             match hunk {
                 codex_apply_patch::Hunk::AddFile { path, contents } => {
-                    let full_path = self.config.cwd.join(path).unwrap_or_else(|_| self.config.cwd.clone());
+                    let full_path = self.config.cwd.join(path);
                     file_names.push(path.display().to_string());
                     locations.push(ToolCallLocation::new(full_path.clone()));
                     // New file: no old_text, new_text is the contents
@@ -2946,7 +2981,7 @@ impl<A: Auth> ThreadActor<A> {
                     )));
                 }
                 codex_apply_patch::Hunk::DeleteFile { path } => {
-                    let full_path = self.config.cwd.join(path).unwrap_or_else(|_| self.config.cwd.clone());
+                    let full_path = self.config.cwd.join(path);
                     file_names.push(path.display().to_string());
                     locations.push(ToolCallLocation::new(full_path.clone()));
                     content.push(ToolCallContent::Diff(
@@ -2958,10 +2993,10 @@ impl<A: Auth> ThreadActor<A> {
                     move_path,
                     chunks,
                 } => {
-                    let full_path = self.config.cwd.join(path).unwrap_or_else(|_| self.config.cwd.clone());
+                    let full_path = self.config.cwd.join(path);
                     let dest_path = move_path
                         .as_ref()
-                        .map(|p| self.config.cwd.join(p).unwrap_or_else(|_| full_path.clone()))
+                        .map(|p| self.config.cwd.join(p))
                         .unwrap_or_else(|| full_path.clone());
                     file_names.push(path.display().to_string());
                     locations.push(ToolCallLocation::new(dest_path.clone()));
