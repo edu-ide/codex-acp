@@ -12,14 +12,14 @@ use agent_client_protocol::{
 };
 use codex_config::types::{McpServerConfig, McpServerTransportConfig};
 use codex_core::{
-    NewThread, RolloutRecorder, ThreadManager, ThreadSortKey, config::Config,
+    NewThread, RolloutRecorder, SortDirection, ThreadManager, ThreadSortKey, config::Config,
     find_thread_path_by_id_str, parse_cursor,
 };
-use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
-use codex_exec_server::EnvironmentManager;
-use codex_login::{CLIENT_ID, CODEX_API_KEY_ENV_VAR, CodexAuth, OPENAI_API_KEY_ENV_VAR};
+use codex_exec_server::{EnvironmentManager, EnvironmentManagerArgs, ExecServerRuntimePaths};
 use codex_login::auth::read_codex_api_key_from_env;
 use codex_login::{AuthManager, read_openai_api_key_from_env};
+use codex_login::{CLIENT_ID, CODEX_API_KEY_ENV_VAR, CodexAuth, OPENAI_API_KEY_ENV_VAR};
+use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_protocol::{
     ThreadId,
     protocol::{InitialHistory, SessionSource},
@@ -62,11 +62,20 @@ impl CodexAgent {
             config.codex_home.clone().to_path_buf(),
             false,
             config.cli_auth_credentials_store_mode,
+            Some(config.chatgpt_base_url.clone()),
         );
 
         let client_capabilities: Arc<Mutex<ClientCapabilities>> = Arc::default();
 
-        let environment_manager = Arc::new(EnvironmentManager::new(None));
+        let environment_manager = Arc::new(
+            ExecServerRuntimePaths::from_optional_paths(
+                config.codex_self_exe.clone(),
+                config.codex_linux_sandbox_exe.clone(),
+            )
+            .map(EnvironmentManagerArgs::from_env)
+            .map(EnvironmentManager::new)
+            .unwrap_or_else(|_| EnvironmentManager::default_for_tests()),
+        );
         let thread_manager = ThreadManager::new(
             &config,
             auth_manager.clone(),
@@ -116,7 +125,10 @@ impl CodexAgent {
     ) -> Result<Config, Error> {
         let mut config = self.config.clone();
         config.include_apply_patch_tool = true;
-        config.cwd = cwd.clone().try_into().map_err(|_e| Error::internal_error())?;
+        config.cwd = cwd
+            .clone()
+            .try_into()
+            .map_err(|_e| Error::internal_error())?;
 
         // Propagate any client-provided MCP servers that codex-rs supports.
         let mut new_mcp_servers = config.mcp_servers.get().clone();
@@ -142,10 +154,12 @@ impl CodexAgent {
                                 },
                                 env_http_headers: None,
                             },
+                            experimental_environment: None,
                             required: false,
                             enabled: true,
                             startup_timeout_sec: None,
                             tool_timeout_sec: None,
+                            default_tools_approval_mode: None,
                             disabled_tools: None,
                             enabled_tools: None,
                             tools: std::collections::HashMap::new(),
@@ -181,10 +195,12 @@ impl CodexAgent {
                                 env_vars: vec![],
                                 cwd: Some(cwd.clone()),
                             },
+                            experimental_environment: None,
                             required: false,
                             enabled: true,
                             startup_timeout_sec: None,
                             tool_timeout_sec: None,
+                            default_tools_approval_mode: None,
                             disabled_tools: None,
                             enabled_tools: None,
                             tools: std::collections::HashMap::new(),
@@ -464,11 +480,13 @@ impl Agent for CodexAgent {
             SESSION_LIST_PAGE_SIZE,
             cursor_obj.as_ref(),
             ThreadSortKey::UpdatedAt,
+            SortDirection::Desc,
             &[
                 SessionSource::Cli,
                 SessionSource::VSCode,
                 SessionSource::Unknown,
             ],
+            None,
             None,
             self.config.model_provider_id.as_str(),
             None,

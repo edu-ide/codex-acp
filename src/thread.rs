@@ -27,9 +27,9 @@ use codex_core::{
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
 };
-use codex_protocol::error::CodexErr;
-use codex_models_manager::manager::{ModelsManager, RefreshStrategy};
 use codex_login::AuthManager;
+use codex_models_manager::manager::{ModelsManager, RefreshStrategy};
+use codex_protocol::error::CodexErr;
 use codex_protocol::{
     approvals::{ElicitationRequest, ElicitationRequestEvent},
     config_types::TrustLevel,
@@ -38,6 +38,7 @@ use codex_protocol::{
     models::{PermissionProfile, ResponseItem, WebSearchAction},
     openai_models::{ModelPreset, ReasoningEffort},
     parse_command::ParsedCommand,
+    permissions::{FileSystemAccessMode, FileSystemPath},
     plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
     protocol::{
         AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent,
@@ -45,10 +46,10 @@ use codex_protocol::{
         ApplyPatchApprovalRequestEvent, DynamicToolCallResponseEvent, ElicitationAction,
         ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent,
         ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExecCommandStatus, ExitedReviewModeEvent,
-        FileChange, ItemCompletedEvent, ItemStartedEvent,
-        McpInvocation, McpStartupCompleteEvent, McpStartupUpdateEvent, McpToolCallBeginEvent,
-        McpToolCallEndEvent, ModelRerouteEvent, NetworkApprovalContext, NetworkPolicyRuleAction,
-        Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus, ReasoningContentDeltaEvent,
+        FileChange, ItemCompletedEvent, ItemStartedEvent, McpInvocation, McpStartupCompleteEvent,
+        McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent, ModelRerouteEvent,
+        NetworkApprovalContext, NetworkPolicyRuleAction, Op, PatchApplyBeginEvent,
+        PatchApplyEndEvent, PatchApplyStatus, ReasoningContentDeltaEvent,
         ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest,
         ReviewTarget, RolloutItem, SandboxPolicy, StreamErrorEvent, TerminalInteractionEvent,
         TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
@@ -73,6 +74,14 @@ use crate::ACP_CLIENT;
 
 static APPROVAL_PRESETS: LazyLock<Vec<ApprovalPreset>> = LazyLock::new(builtin_approval_presets);
 const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
+
+fn file_system_path_label(path: &FileSystemPath) -> String {
+    match path {
+        FileSystemPath::Path { path } => path.display().to_string(),
+        FileSystemPath::GlobPattern { pattern } => pattern.clone(),
+        FileSystemPath::Special { value } => format!("{value:?}"),
+    }
+}
 
 /// Trait for abstracting over the `CodexThread` to make testing easier.
 #[async_trait::async_trait]
@@ -570,19 +579,23 @@ impl PromptState {
                         "approved-for-session" => RequestPermissionsResponse {
                             permissions: permissions.into(),
                             scope: PermissionGrantScope::Session,
+                            strict_auto_review: false,
                         },
                         "approved" => RequestPermissionsResponse {
                             permissions: permissions.into(),
                             scope: PermissionGrantScope::Turn,
+                            strict_auto_review: false,
                         },
                         _ => RequestPermissionsResponse {
                             permissions: RequestPermissionProfile::default(),
                             scope: PermissionGrantScope::Turn,
+                            strict_auto_review: false,
                         },
                     },
                     RequestPermissionOutcome::Cancelled | _ => RequestPermissionsResponse {
                         permissions: RequestPermissionProfile::default(),
                         scope: PermissionGrantScope::Turn,
+                        strict_auto_review: false,
                     },
                 };
 
@@ -786,7 +799,7 @@ impl PromptState {
                 );
                 self.terminal_interaction(client, event).await;
             }
-            EventMsg::DynamicToolCallRequest(DynamicToolCallRequest { call_id, turn_id, tool, arguments }) => {
+            EventMsg::DynamicToolCallRequest(DynamicToolCallRequest { call_id, turn_id, tool, arguments, .. }) => {
                 info!("Dynamic tool call request: call_id={call_id}, turn_id={turn_id}, tool={tool}");
                 self.start_dynamic_tool_call(client, call_id, tool, arguments).await;
             }
@@ -859,6 +872,7 @@ impl PromptState {
                 turn_id,
                 completed_at: _,
                 duration_ms: _,
+                ..
             }) => {
                 info!(
                     "Task {turn_id} completed successfully after {} events. Last agent message: {last_agent_message:?}",
@@ -914,6 +928,7 @@ impl PromptState {
                 turn_id,
                 completed_at: _,
                 duration_ms: _,
+                ..
             }) => {
                 info!("Turn {turn_id:?} aborted: {reason:?}");
                 self.abort_pending_interactions();
@@ -957,6 +972,10 @@ impl PromptState {
                 warn!("Warning: {message}");
                 // Forward warnings to the client as agent messages so users see
                 // informational notices (e.g., the post-compact advisory message).
+                client.send_agent_text(message).await;
+            }
+            EventMsg::GuardianWarning(WarningEvent { message }) => {
+                warn!("Guardian warning: {message}");
                 client.send_agent_text(message).await;
             }
             EventMsg::McpStartupUpdate(McpStartupUpdateEvent { server, status }) => {
@@ -1274,6 +1293,7 @@ impl PromptState {
             success,
             error,
             duration: _,
+            ..
         } = event;
 
         client
@@ -1748,6 +1768,7 @@ impl PromptState {
             turn_id: _,
             reason,
             permissions,
+            ..
         } = event;
 
         // Create a new tool call for the command execution
@@ -1759,16 +1780,28 @@ impl PromptState {
             content.push(reason.clone());
         }
         if let Some(file_system) = permissions.file_system.as_ref() {
-            if let Some(read) = file_system.read.as_ref() {
+            let read = file_system
+                .entries
+                .iter()
+                .filter(|entry| entry.access == FileSystemAccessMode::Read)
+                .map(|entry| file_system_path_label(&entry.path))
+                .collect::<Vec<_>>();
+            if !read.is_empty() {
                 content.push(format!(
                     "File System Read Access: {}",
-                    read.iter().map(|p| p.display()).join(", ")
+                    read.iter().join(", ")
                 ));
             }
-            if let Some(write) = file_system.write.as_ref() {
+            let write = file_system
+                .entries
+                .iter()
+                .filter(|entry| entry.access == FileSystemAccessMode::Write)
+                .map(|entry| file_system_path_label(&entry.path))
+                .collect::<Vec<_>>();
+            if !write.is_empty() {
                 content.push(format!(
                     "File System Write Access: {}",
-                    write.iter().map(|p| p.display()).join(", ")
+                    write.iter().join(", ")
                 ));
             }
         }
@@ -2581,6 +2614,7 @@ impl<A: Auth> ThreadActor<A> {
                 cwd: None,
                 approval_policy: None,
                 sandbox_policy: None,
+                permission_profile: None,
                 model: Some(model_to_use.clone()),
                 effort: Some(effort_to_use),
                 summary: None,
@@ -2628,6 +2662,7 @@ impl<A: Auth> ThreadActor<A> {
                 cwd: None,
                 approval_policy: None,
                 sandbox_policy: None,
+                permission_profile: None,
                 model: None,
                 effort: Some(Some(effort)),
                 summary: None,
@@ -2703,6 +2738,7 @@ impl<A: Auth> ThreadActor<A> {
                             text: INIT_COMMAND_PROMPT.into(),
                             text_elements: vec![],
                         }],
+                        environments: None,
                         final_output_json_schema: None,
                         responsesapi_client_metadata: None,
                     }
@@ -2754,6 +2790,7 @@ impl<A: Auth> ThreadActor<A> {
                 _ => {
                     op = Op::UserInput {
                         items,
+                        environments: None,
                         final_output_json_schema: None,
                         responsesapi_client_metadata: None,
                     }
@@ -2762,6 +2799,7 @@ impl<A: Auth> ThreadActor<A> {
         } else {
             op = Op::UserInput {
                 items,
+                environments: None,
                 final_output_json_schema: None,
                 responsesapi_client_metadata: None,
             }
@@ -2799,6 +2837,7 @@ impl<A: Auth> ThreadActor<A> {
                 cwd: None,
                 approval_policy: Some(preset.approval),
                 sandbox_policy: Some(preset.sandbox.clone()),
+                permission_profile: None,
                 model: None,
                 effort: None,
                 summary: None,
@@ -2866,6 +2905,7 @@ impl<A: Auth> ThreadActor<A> {
                 cwd: None,
                 approval_policy: None,
                 sandbox_policy: None,
+                permission_profile: None,
                 model: Some(model_to_use.clone()),
                 effort: Some(effort_to_use),
                 summary: None,
@@ -3201,7 +3241,9 @@ impl<A: Auth> ThreadActor<A> {
                     )
                     .await;
             }
-            ResponseItem::CustomToolCallOutput { call_id, output, .. } => {
+            ResponseItem::CustomToolCallOutput {
+                call_id, output, ..
+            } => {
                 self.client
                     .send_tool_call_completed(call_id.clone(), Some(serde_json::json!(output)))
                     .await;
