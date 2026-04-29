@@ -746,7 +746,7 @@ impl PromptState {
                 info!("Agent plan updated. Explanation: {:?}", explanation);
                 client.update_plan(plan).await;
             }
-            EventMsg::WebSearchBegin(WebSearchBeginEvent { call_id }) => {
+            EventMsg::WebSearchBegin(WebSearchBeginEvent { call_id, query: _query }) => {
                 info!("Web search started: call_id={}", call_id);
                 // Create a ToolCall notification for the search beginning
                 self.start_web_search(client, call_id).await;
