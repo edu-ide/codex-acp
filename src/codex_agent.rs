@@ -13,13 +13,13 @@ use agent_client_protocol::{
 use codex_config::types::{McpServerConfig, McpServerTransportConfig};
 use codex_core::{
     NewThread, RolloutRecorder, SortDirection, ThreadManager, ThreadSortKey, config::Config,
-    find_thread_path_by_id_str, parse_cursor,
+    find_thread_path_by_id_str, parse_cursor, resolve_installation_id, thread_store_from_config,
 };
 use codex_exec_server::{EnvironmentManager, EnvironmentManagerArgs, ExecServerRuntimePaths};
+use codex_extension_api::empty_extension_registry;
 use codex_login::auth::read_codex_api_key_from_env;
 use codex_login::{AuthManager, read_openai_api_key_from_env};
 use codex_login::{CLIENT_ID, CODEX_API_KEY_ENV_VAR, CodexAuth, OPENAI_API_KEY_ENV_VAR};
-use codex_models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use codex_protocol::{
     ThreadId,
     protocol::{InitialHistory, SessionSource},
@@ -27,6 +27,7 @@ use codex_protocol::{
 use std::{
     cell::RefCell,
     collections::HashMap,
+    io,
     path::PathBuf,
     rc::Rc,
     sync::{Arc, Mutex},
@@ -34,7 +35,7 @@ use std::{
 use tracing::{debug, info, warn};
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::thread::{ModelsManagerImpl, Thread};
+use crate::thread::{Thread, models_manager_impl};
 
 /// The Codex implementation of the ACP Agent trait.
 ///
@@ -57,43 +58,49 @@ const SESSION_TITLE_MAX_GRAPHEMES: usize = 120;
 
 impl CodexAgent {
     /// Create a new `CodexAgent` with the given configuration
-    pub fn new(config: Config) -> Self {
+    pub async fn new(config: Config) -> io::Result<Self> {
         let auth_manager = AuthManager::shared(
             config.codex_home.clone().to_path_buf(),
             false,
             config.cli_auth_credentials_store_mode,
             Some(config.chatgpt_base_url.clone()),
-        );
+        )
+        .await;
 
         let client_capabilities: Arc<Mutex<ClientCapabilities>> = Arc::default();
 
-        let environment_manager = Arc::new(
-            ExecServerRuntimePaths::from_optional_paths(
-                config.codex_self_exe.clone(),
-                config.codex_linux_sandbox_exe.clone(),
-            )
-            .map(EnvironmentManagerArgs::from_env)
-            .map(EnvironmentManager::new)
-            .unwrap_or_else(|_| EnvironmentManager::default_for_tests()),
-        );
+        let environment_manager = match ExecServerRuntimePaths::from_optional_paths(
+            config.codex_self_exe.clone(),
+            config.codex_linux_sandbox_exe.clone(),
+        ) {
+            Ok(paths) => {
+                Arc::new(EnvironmentManager::new(EnvironmentManagerArgs::new(paths)).await)
+            }
+            Err(_) => Arc::new(EnvironmentManager::default_for_tests()),
+        };
+        let thread_store = thread_store_from_config(&config, /*state_db*/ None);
+        let installation_id = resolve_installation_id(&config.codex_home)
+            .await
+            .map_err(io::Error::other)?;
         let thread_manager = ThreadManager::new(
             &config,
             auth_manager.clone(),
             SessionSource::Unknown,
-            CollaborationModesConfig {
-                // False for now
-                default_mode_request_user_input: false,
-            },
             environment_manager,
-            None,
+            empty_extension_registry(),
+            /*analytics_events_client*/ None,
+            thread_store,
+            /*state_db*/ None,
+            installation_id,
+            /*attestation_provider*/ None,
         );
-        Self {
+        Ok(Self {
             auth_manager,
             client_capabilities,
             config,
             thread_manager,
             sessions: RefCell::default(),
-        }
+        })
     }
 
     fn session_id_from_thread_id(thread_id: ThreadId) -> SessionId {
@@ -124,7 +131,6 @@ impl CodexAgent {
         mcp_servers: Vec<McpServer>,
     ) -> Result<Config, Error> {
         let mut config = self.config.clone();
-        config.include_apply_patch_tool = true;
         config.cwd = cwd
             .clone()
             .try_into()
@@ -164,6 +170,7 @@ impl CodexAgent {
                             experimental_environment: None,
                             disabled_reason: None,
                             scopes: None,
+                            oauth: None,
                             oauth_resource: None,
                             supports_parallel_tool_calls: false,
                             default_tools_approval_mode: None,
@@ -203,6 +210,7 @@ impl CodexAgent {
                             experimental_environment: None,
                             disabled_reason: None,
                             scopes: None,
+                            oauth: None,
                             oauth_resource: None,
                             supports_parallel_tool_calls: false,
                             default_tools_approval_mode: None,
@@ -300,7 +308,7 @@ impl Agent for CodexAgent {
                 tokio::spawn(async move {
                     match server.block_until_done().await {
                         Ok(()) => {
-                            auth_manager.reload();
+                            auth_manager.reload().await;
                         }
                         Err(err) => warn!("ChatGPT OAuth login did not complete: {err}"),
                     }
@@ -346,7 +354,7 @@ impl Agent for CodexAgent {
             }
         }
 
-        self.auth_manager.reload();
+        self.auth_manager.reload().await;
 
         Ok(AuthenticateResponse::new())
     }
@@ -376,7 +384,7 @@ impl Agent for CodexAgent {
             session_id.clone(),
             thread,
             self.auth_manager.clone(),
-            self.thread_manager.get_models_manager(),
+            models_manager_impl(self.thread_manager.get_models_manager()),
             self.client_capabilities.clone(),
             config.clone(),
         ));
@@ -409,11 +417,14 @@ impl Agent for CodexAgent {
             ..
         } = request;
 
-        let rollout_path =
-            find_thread_path_by_id_str(&self.config.codex_home, session_id.0.as_ref())
-                .await
-                .map_err(|e| Error::internal_error().data(e.to_string()))?
-                .ok_or_else(|| Error::resource_not_found(None))?;
+        let rollout_path = find_thread_path_by_id_str(
+            &self.config.codex_home,
+            session_id.0.as_ref(),
+            /*state_db_ctx*/ None,
+        )
+        .await
+        .map_err(|e| Error::internal_error().data(e.to_string()))?
+        .ok_or_else(|| Error::resource_not_found(None))?;
 
         let history = RolloutRecorder::get_rollout_history(&rollout_path)
             .await
@@ -445,7 +456,7 @@ impl Agent for CodexAgent {
             session_id.clone(),
             thread,
             self.auth_manager.clone(),
-            self.thread_manager.get_models_manager(),
+            models_manager_impl(self.thread_manager.get_models_manager()),
             self.client_capabilities.clone(),
             config.clone(),
         ));
@@ -472,6 +483,7 @@ impl Agent for CodexAgent {
         let cursor_obj = cursor.as_deref().and_then(parse_cursor);
 
         let page = RolloutRecorder::list_threads(
+            /*state_db_ctx*/ None,
             &self.config,
             SESSION_LIST_PAGE_SIZE,
             cursor_obj.as_ref(),

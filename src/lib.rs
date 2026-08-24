@@ -26,7 +26,7 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     // Create our Agent implementation
-    let agent = Rc::new(codex_agent::CodexAgent::new(config));
+    let agent = Rc::new(codex_agent::CodexAgent::new(config).await?);
 
     let compat_reader = reader.compat();
     let compat_writer = writer.compat_write();

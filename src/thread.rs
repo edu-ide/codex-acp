@@ -1,73 +1,158 @@
-use std::{
-    cell::RefCell,
-    collections::HashMap,
-    ops::DerefMut,
-    path::{Path, PathBuf},
-    rc::Rc,
-    sync::{Arc, LazyLock, Mutex},
-};
+use std::collections::HashMap;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::Mutex;
 
-use agent_client_protocol::{
-    AvailableCommand, AvailableCommandInput, AvailableCommandsUpdate, Client, ClientCapabilities,
-    ConfigOptionUpdate, Content, ContentBlock, ContentChunk, Diff, EmbeddedResource,
-    EmbeddedResourceResource, Error, LoadSessionResponse, Meta, ModelId, ModelInfo,
-    PermissionOption, PermissionOptionKind, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
-    PromptRequest, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    ResourceLink, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption,
-    SessionConfigValueId, SessionId, SessionInfoUpdate, SessionMode, SessionModeId,
-    SessionModeState, SessionModelState, SessionNotification, SessionUpdate, StopReason, Terminal,
-    TextResourceContents, ToolCall, ToolCallContent, ToolCallId, ToolCallLocation, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UnstructuredCommandInput, UsageUpdate,
-};
+use agent_client_protocol::AvailableCommand;
+use agent_client_protocol::AvailableCommandInput;
+use agent_client_protocol::AvailableCommandsUpdate;
+use agent_client_protocol::Client;
+use agent_client_protocol::ClientCapabilities;
+use agent_client_protocol::ConfigOptionUpdate;
+use agent_client_protocol::Content;
+use agent_client_protocol::ContentBlock;
+use agent_client_protocol::ContentChunk;
+use agent_client_protocol::Diff;
+use agent_client_protocol::EmbeddedResource;
+use agent_client_protocol::EmbeddedResourceResource;
+use agent_client_protocol::Error;
+use agent_client_protocol::LoadSessionResponse;
+use agent_client_protocol::Meta;
+use agent_client_protocol::ModelId;
+use agent_client_protocol::ModelInfo;
+use agent_client_protocol::PermissionOption;
+use agent_client_protocol::PermissionOptionKind;
+use agent_client_protocol::Plan;
+use agent_client_protocol::PlanEntry;
+use agent_client_protocol::PlanEntryPriority;
+use agent_client_protocol::PlanEntryStatus;
+use agent_client_protocol::PromptRequest;
+use agent_client_protocol::RequestPermissionOutcome;
+use agent_client_protocol::RequestPermissionRequest;
+use agent_client_protocol::RequestPermissionResponse;
+use agent_client_protocol::ResourceLink;
+use agent_client_protocol::SelectedPermissionOutcome;
+use agent_client_protocol::SessionConfigId;
+use agent_client_protocol::SessionConfigOption;
+use agent_client_protocol::SessionConfigOptionCategory;
+use agent_client_protocol::SessionConfigOptionValue;
+use agent_client_protocol::SessionConfigSelectOption;
+use agent_client_protocol::SessionConfigValueId;
+use agent_client_protocol::SessionId;
+use agent_client_protocol::SessionMode;
+use agent_client_protocol::SessionModeId;
+use agent_client_protocol::SessionModeState;
+use agent_client_protocol::SessionModelState;
+use agent_client_protocol::SessionNotification;
+use agent_client_protocol::SessionUpdate;
+use agent_client_protocol::StopReason;
+use agent_client_protocol::Terminal;
+use agent_client_protocol::TextResourceContents;
+use agent_client_protocol::ToolCall;
+use agent_client_protocol::ToolCallContent;
+use agent_client_protocol::ToolCallId;
+use agent_client_protocol::ToolCallLocation;
+use agent_client_protocol::ToolCallStatus;
+use agent_client_protocol::ToolCallUpdate;
+use agent_client_protocol::ToolCallUpdateFields;
+use agent_client_protocol::ToolKind;
+use agent_client_protocol::UnstructuredCommandInput;
+use agent_client_protocol::UsageUpdate;
 use codex_apply_patch::parse_patch;
-use codex_core::{
-    CodexThread,
-    config::{Config, set_project_trust_level},
-    review_format::format_review_findings_block,
-    review_prompts::user_facing_hint,
-};
+use codex_core::CodexThread;
+use codex_core::config::Config;
+use codex_core::config::set_project_trust_level;
+use codex_core::review_format::format_review_findings_block;
+use codex_core::review_prompts::user_facing_hint;
 use codex_login::AuthManager;
-use codex_models_manager::manager::{ModelsManager, RefreshStrategy};
+use codex_models_manager::manager::ModelsManager;
+use codex_models_manager::manager::RefreshStrategy;
+use codex_protocol::approvals::ElicitationRequest;
+use codex_protocol::approvals::ElicitationRequestEvent;
+use codex_protocol::config_types::TrustLevel;
+use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
+use codex_protocol::dynamic_tools::DynamicToolCallRequest;
 use codex_protocol::error::CodexErr;
-use codex_protocol::{
-    approvals::{ElicitationRequest, ElicitationRequestEvent},
-    config_types::TrustLevel,
-    dynamic_tools::{DynamicToolCallOutputContentItem, DynamicToolCallRequest},
-    mcp::CallToolResult,
-    models::{PermissionProfile, ResponseItem, WebSearchAction},
-    openai_models::{ModelPreset, ReasoningEffort},
-    parse_command::ParsedCommand,
-    permissions::{FileSystemAccessMode, FileSystemPath},
-    plan_tool::{PlanItemArg, StepStatus, UpdatePlanArgs},
-    protocol::{
-        AgentMessageContentDeltaEvent, AgentMessageEvent, AgentReasoningEvent,
-        AgentReasoningRawContentEvent, AgentReasoningSectionBreakEvent,
-        ApplyPatchApprovalRequestEvent, DynamicToolCallResponseEvent, ElicitationAction,
-        ErrorEvent, Event, EventMsg, ExecApprovalRequestEvent, ExecCommandBeginEvent,
-        ExecCommandEndEvent, ExecCommandOutputDeltaEvent, ExecCommandStatus, ExitedReviewModeEvent,
-        FileChange, ItemCompletedEvent, ItemStartedEvent, McpInvocation, McpStartupCompleteEvent,
-        McpStartupUpdateEvent, McpToolCallBeginEvent, McpToolCallEndEvent, ModelRerouteEvent,
-        NetworkApprovalContext, NetworkPolicyRuleAction, Op, PatchApplyBeginEvent,
-        PatchApplyEndEvent, PatchApplyStatus, ReasoningContentDeltaEvent,
-        ReasoningRawContentDeltaEvent, ReviewDecision, ReviewOutputEvent, ReviewRequest,
-        ReviewTarget, RolloutItem, SandboxPolicy, StreamErrorEvent, TerminalInteractionEvent,
-        TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
-        ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
-    },
-    request_permissions::{
-        PermissionGrantScope, RequestPermissionProfile, RequestPermissionsEvent,
-        RequestPermissionsResponse,
-    },
-    user_input::UserInput,
-};
+use codex_protocol::mcp::CallToolResult;
+use codex_protocol::models::AdditionalPermissionProfile;
+use codex_protocol::models::ResponseItem;
+use codex_protocol::models::WebSearchAction;
+use codex_protocol::openai_models::ModelPreset;
+use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::parse_command::ParsedCommand;
+use codex_protocol::permissions::FileSystemAccessMode;
+use codex_protocol::permissions::FileSystemPath;
+use codex_protocol::plan_tool::PlanItemArg;
+use codex_protocol::plan_tool::StepStatus;
+use codex_protocol::plan_tool::UpdatePlanArgs;
+use codex_protocol::protocol::AgentMessageContentDeltaEvent;
+use codex_protocol::protocol::AgentMessageEvent;
+use codex_protocol::protocol::AgentReasoningEvent;
+use codex_protocol::protocol::AgentReasoningRawContentEvent;
+use codex_protocol::protocol::AgentReasoningSectionBreakEvent;
+use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
+use codex_protocol::protocol::DynamicToolCallResponseEvent;
+use codex_protocol::protocol::ElicitationAction;
+use codex_protocol::protocol::ErrorEvent;
+use codex_protocol::protocol::Event;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ExecApprovalRequestEvent;
+use codex_protocol::protocol::ExecCommandBeginEvent;
+use codex_protocol::protocol::ExecCommandEndEvent;
+use codex_protocol::protocol::ExecCommandOutputDeltaEvent;
+use codex_protocol::protocol::ExecCommandStatus;
+use codex_protocol::protocol::ExitedReviewModeEvent;
+use codex_protocol::protocol::FileChange;
+use codex_protocol::protocol::ItemCompletedEvent;
+use codex_protocol::protocol::ItemStartedEvent;
+use codex_protocol::protocol::McpInvocation;
+use codex_protocol::protocol::McpStartupCompleteEvent;
+use codex_protocol::protocol::McpStartupUpdateEvent;
+use codex_protocol::protocol::McpToolCallBeginEvent;
+use codex_protocol::protocol::McpToolCallEndEvent;
+use codex_protocol::protocol::ModelRerouteEvent;
+use codex_protocol::protocol::NetworkApprovalContext;
+use codex_protocol::protocol::NetworkPolicyRuleAction;
+use codex_protocol::protocol::Op;
+use codex_protocol::protocol::PatchApplyBeginEvent;
+use codex_protocol::protocol::PatchApplyEndEvent;
+use codex_protocol::protocol::PatchApplyStatus;
+use codex_protocol::protocol::ReasoningContentDeltaEvent;
+use codex_protocol::protocol::ReasoningRawContentDeltaEvent;
+use codex_protocol::protocol::ReviewDecision;
+use codex_protocol::protocol::ReviewOutputEvent;
+use codex_protocol::protocol::ReviewRequest;
+use codex_protocol::protocol::ReviewTarget;
+use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::StreamErrorEvent;
+use codex_protocol::protocol::TerminalInteractionEvent;
+use codex_protocol::protocol::TokenCountEvent;
+use codex_protocol::protocol::TurnAbortedEvent;
+use codex_protocol::protocol::TurnCompleteEvent;
+use codex_protocol::protocol::TurnStartedEvent;
+use codex_protocol::protocol::UserMessageEvent;
+use codex_protocol::protocol::ViewImageToolCallEvent;
+use codex_protocol::protocol::WarningEvent;
+use codex_protocol::protocol::WebSearchBeginEvent;
+use codex_protocol::protocol::WebSearchEndEvent;
+use codex_protocol::request_permissions::PermissionGrantScope;
+use codex_protocol::request_permissions::RequestPermissionProfile;
+use codex_protocol::request_permissions::RequestPermissionsEvent;
+use codex_protocol::request_permissions::RequestPermissionsResponse;
+use codex_protocol::user_input::UserInput;
 use codex_shell_command::parse_command::parse_command;
-use codex_utils_approval_presets::{ApprovalPreset, builtin_approval_presets};
+use codex_utils_approval_presets::ApprovalPreset;
+use codex_utils_approval_presets::builtin_approval_presets;
 use heck::ToTitleCase;
 use itertools::Itertools;
 use serde_json::json;
-use tokio::sync::{mpsc, oneshot};
-use tracing::{error, info, warn};
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+use tracing::error;
+use tracing::info;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::ACP_CLIENT;
@@ -108,25 +193,34 @@ pub trait ModelsManagerImpl {
 }
 
 #[async_trait::async_trait]
-impl ModelsManagerImpl for ModelsManager {
+impl ModelsManagerImpl for Arc<dyn ModelsManager> {
     async fn get_model(&self, model_id: &Option<String>) -> String {
         self.get_default_model(model_id, RefreshStrategy::OnlineIfUncached)
             .await
     }
 
     async fn list_models(&self) -> Vec<ModelPreset> {
-        self.list_models(RefreshStrategy::OnlineIfUncached).await
+        self.as_ref()
+            .list_models(RefreshStrategy::OnlineIfUncached)
+            .await
     }
 }
 
-pub trait Auth {
-    fn logout(&self) -> Result<bool, Error>;
+pub fn models_manager_impl(manager: Arc<dyn ModelsManager>) -> Arc<dyn ModelsManagerImpl> {
+    Arc::new(manager)
 }
 
+#[async_trait::async_trait(?Send)]
+pub trait Auth {
+    async fn logout(&self) -> Result<bool, Error>;
+}
+
+#[async_trait::async_trait(?Send)]
 impl Auth for Arc<AuthManager> {
-    fn logout(&self) -> Result<bool, Error> {
+    async fn logout(&self) -> Result<bool, Error> {
         self.as_ref()
             .logout()
+            .await
             .map_err(|e: std::io::Error| Error::internal_error().data(e.to_string()))
     }
 }
@@ -348,7 +442,7 @@ enum PendingPermissionRequest {
     },
     RequestPermissions {
         call_id: String,
-        permissions: PermissionProfile,
+        permissions: RequestPermissionProfile,
     },
 }
 
@@ -665,14 +759,21 @@ impl PromptState {
                             .await;
                     }
             }
-            EventMsg::ItemStarted(ItemStartedEvent { thread_id, turn_id, item }) => {
+            EventMsg::ItemStarted(ItemStartedEvent {
+                thread_id,
+                turn_id,
+                item,
+                ..
+            }) => {
                 info!("Item started with thread_id: {thread_id}, turn_id: {turn_id}, item: {item:?}");
             }
             EventMsg::UserMessage(UserMessageEvent {
                 message,
                 images: _,
+                image_details: _,
                 text_elements: _,
                 local_images: _,
+                local_image_details: _,
             }) => {
                 info!("User message: {message:?}");
             }
@@ -731,22 +832,12 @@ impl PromptState {
                     client.send_agent_thought(text).await;
                 }
             }
-            EventMsg::ThreadNameUpdated(event) => {
-                info!("Thread name updated: {:?}", event.thread_name);
-                if let Some(title) = event.thread_name {
-                    client
-                        .send_notification(SessionUpdate::SessionInfoUpdate(
-                            SessionInfoUpdate::new().title(title),
-                        ))
-                        .await;
-                }
-            }
             EventMsg::PlanUpdate(UpdatePlanArgs { explanation, plan }) => {
                 // Send this to the client via session/update notification
                 info!("Agent plan updated. Explanation: {:?}", explanation);
                 client.update_plan(plan).await;
             }
-            EventMsg::WebSearchBegin(WebSearchBeginEvent { call_id, query: _query }) => {
+            EventMsg::WebSearchBegin(WebSearchBeginEvent { call_id }) => {
                 info!("Web search started: call_id={}", call_id);
                 // Create a ToolCall notification for the search beginning
                 self.start_web_search(client, call_id).await;
@@ -864,6 +955,7 @@ impl PromptState {
                 thread_id,
                 turn_id,
                 item,
+                ..
             }) => {
                 info!("Item completed: thread_id={}, turn_id={}, item={:?}", thread_id, turn_id, item);
             }
@@ -882,23 +974,6 @@ impl PromptState {
                 if let Some(response_tx) = self.response_tx.take() {
                     response_tx.send(Ok(StopReason::EndTurn)).ok();
                 }
-            }
-            EventMsg::UndoStarted(event) => {
-                client
-                    .send_agent_text(
-                        event
-                            .message
-                            .unwrap_or_else(|| "Undo in progress...".to_string()),
-                    )
-                    .await;
-            }
-            EventMsg::UndoCompleted(event) => {
-                let fallback = if event.success {
-                    "Undo completed.".to_string()
-                } else {
-                    "Undo failed.".to_string()
-                };
-                client.send_agent_text(event.message.unwrap_or(fallback)).await;
             }
             EventMsg::StreamError(StreamErrorEvent {
                 message,
@@ -1006,12 +1081,6 @@ impl PromptState {
                 info!("Context compacted");
                 client.send_agent_text("Context compacted\n".to_string()).await;
             }
-            EventMsg::LoopLifecycleStarted(..)
-            | EventMsg::LoopLifecycleProgress(..)
-            | EventMsg::LoopLifecycleCompleted(..)
-            | EventMsg::LoopLifecycleFailed(..) => {
-                // Loop lifecycle visibility is handled in the TUI/app-server path for now.
-            }
             EventMsg::RequestPermissions(event) => {
                 info!("Request permissions: {} {}", event.call_id, event.turn_id);
                 if let Err(err) = self.request_permissions(client, event).await
@@ -1030,13 +1099,6 @@ impl PromptState {
             | EventMsg::HookCompleted(..)
             // we already have a way to diff the turn, so ignore
             | EventMsg::TurnDiff(..)
-            // Revisit when we can emit status updates
-            | EventMsg::BackgroundEvent(..)
-            | EventMsg::SkillsUpdateAvailable
-            // Old events
-            | EventMsg::AgentMessageDelta(..)
-            | EventMsg::AgentReasoningDelta(..)
-            | EventMsg::AgentReasoningRawContentDelta(..)
             | EventMsg::RawResponseItem(..)
             | EventMsg::SessionConfigured(..)
             // TODO: Subagent UI?
@@ -1055,13 +1117,10 @@ impl PromptState {
             | EventMsg::CollabCloseEnd(..)
             | EventMsg::RealtimeConversationSdp(..)
             | EventMsg::RealtimeConversationListVoicesResponse(..)
+            | EventMsg::ModelVerification(..)
+            | EventMsg::ThreadGoalUpdated(..)
             | EventMsg::PlanDelta(..) => {}
-            e @ (EventMsg::McpListToolsResponse(..)
-            | EventMsg::ListSkillsResponse(..)
-            | EventMsg::ListCommandsResponse(..)
-            // Used for returning a single history entry
-            | EventMsg::GetHistoryEntryResponse(..)
-            | EventMsg::DeprecationNotice(..)
+            e @ (EventMsg::DeprecationNotice(..)
             | EventMsg::GuardianAssessment(..)
             | EventMsg::RequestUserInput(..)) => {
                 warn!("Unexpected event: {:?}", e);
@@ -1149,6 +1208,7 @@ impl PromptState {
             // grant_root doesn't seem to be set anywhere on the codex side
             grant_root: _,
             turn_id: _,
+            started_at_ms: _,
         } = event;
         let (title, locations, content) = extract_tool_call_content_from_changes(changes);
         let request_key = patch_request_key(&call_id);
@@ -1390,6 +1450,7 @@ impl PromptState {
             additional_permissions,
             available_decisions: _,
             proposed_network_policy_amendments,
+            started_at_ms: _,
         } = event;
 
         // Create a new tool call for the command execution
@@ -1502,6 +1563,7 @@ impl PromptState {
             cwd,
             parsed_cmd,
             process_id: _,
+            ..
         } = event;
         // Create a new tool call for the command execution
         let tool_call_id = ToolCallId::new(call_id.clone());
@@ -1615,6 +1677,7 @@ impl PromptState {
             formatted_output: _,
             process_id: _,
             status,
+            ..
         } = event;
         if let Some(active_command) = self.active_commands.remove(&call_id) {
             let is_success = exit_code == 0;
@@ -1821,7 +1884,7 @@ impl PromptState {
             permissions_request_key(&call_id),
             PendingPermissionRequest::RequestPermissions {
                 call_id,
-                permissions: permissions.into(),
+                permissions,
             },
             ToolCallUpdate::new(
                 tool_call_id,
@@ -1856,7 +1919,7 @@ struct ExecPermissionOption {
 fn build_exec_permission_options(
     available_decisions: &[ReviewDecision],
     network_approval_context: Option<&NetworkApprovalContext>,
-    additional_permissions: Option<&PermissionProfile>,
+    additional_permissions: Option<&AdditionalPermissionProfile>,
 ) -> Vec<ExecPermissionOption> {
     available_decisions
         .iter()
@@ -2273,7 +2336,7 @@ impl<A: Auth> ThreadActor<A> {
                 let result = self.handle_load().await;
                 drop(response_tx.send(result));
                 let client = self.client.clone();
-                let mut available_commands = Self::builtin_commands();
+                let available_commands = Self::builtin_commands();
                 client
                     .send_notification(SessionUpdate::AvailableCommandsUpdate(
                         AvailableCommandsUpdate::new(available_commands),
@@ -2386,7 +2449,8 @@ impl<A: Auth> ThreadActor<A> {
             .iter()
             .find(|preset| {
                 &preset.approval == self.config.permissions.approval_policy.get()
-                    && &preset.sandbox == self.config.permissions.sandbox_policy.get()
+                    && &preset.permission_profile
+                        == self.config.permissions.permission_profile().get()
             })
             .or_else(|| {
                 // When the project is untrusted, the above code won't match
@@ -2731,7 +2795,7 @@ impl<A: Auth> ThreadActor<A> {
         if let Some((name, rest)) = extract_slash_command(&items) {
             match name {
                 "compact" => op = Op::Compact,
-                "undo" => op = Op::Undo,
+                "undo" => op = Op::ThreadRollback { num_turns: 1 },
                 "init" => {
                     op = Op::UserInput {
                         items: vec![UserInput::Text {
@@ -2784,7 +2848,7 @@ impl<A: Auth> ThreadActor<A> {
                     }
                 }
                 "logout" => {
-                    self.auth.logout()?;
+                    self.auth.logout().await?;
                     return Err(Error::auth_required());
                 }
                 _ => {
@@ -2836,8 +2900,8 @@ impl<A: Auth> ThreadActor<A> {
             .submit(Op::OverrideTurnContext {
                 cwd: None,
                 approval_policy: Some(preset.approval),
-                sandbox_policy: Some(preset.sandbox.clone()),
-                permission_profile: None,
+                sandbox_policy: None,
+                permission_profile: Some(preset.permission_profile.clone()),
                 model: None,
                 effort: None,
                 summary: None,
@@ -2857,22 +2921,15 @@ impl<A: Auth> ThreadActor<A> {
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
         self.config
             .permissions
-            .sandbox_policy
-            .set(preset.sandbox.clone())
+            .set_permission_profile(preset.permission_profile.clone())
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
-        match preset.sandbox {
-            // Treat this user action as a trusted dir
-            SandboxPolicy::DangerFullAccess
-            | SandboxPolicy::WorkspaceWrite { .. }
-            | SandboxPolicy::ExternalSandbox { .. } => {
-                set_project_trust_level(
-                    &self.config.codex_home,
-                    &self.config.cwd,
-                    TrustLevel::Trusted,
-                )?;
-            }
-            SandboxPolicy::ReadOnly { .. } => {}
+        if preset.id != "read-only" {
+            set_project_trust_level(
+                &self.config.codex_home,
+                &self.config.cwd,
+                TrustLevel::Trusted,
+            )?;
         }
 
         Ok(())
@@ -3286,6 +3343,7 @@ fn build_prompt_items(prompt: Vec<ContentBlock>) -> Vec<UserInput> {
             }),
             ContentBlock::Image(image_block) => Some(UserInput::Image {
                 image_url: format!("data:{};base64,{}", image_block.mime_type, image_block.data),
+                detail: None,
             }),
             ContentBlock::ResourceLink(ResourceLink { name, uri, .. }) => Some(UserInput::Text {
                 text: format_uri_as_link(Some(name), uri),
@@ -3433,13 +3491,15 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
-    use agent_client_protocol::{RequestPermissionResponse, TextContent};
-    use codex_core::{config::ConfigOverrides, test_support::all_model_presets};
+    use agent_client_protocol::RequestPermissionResponse;
+    use agent_client_protocol::TextContent;
+    use codex_core::config::ConfigOverrides;
+    use codex_core::test_support::all_model_presets;
     use codex_protocol::config_types::ModeKind;
-    use tokio::{
-        sync::{Mutex, Notify, mpsc::UnboundedSender},
-        task::LocalSet,
-    };
+    use tokio::sync::Mutex;
+    use tokio::sync::Notify;
+    use tokio::sync::mpsc::UnboundedSender;
+    use tokio::task::LocalSet;
 
     use super::*;
 
@@ -3541,28 +3601,13 @@ mod tests {
         )?;
 
         let notifications = client.notifications.lock().unwrap();
-        assert_eq!(
-            notifications.len(),
-            2,
+        assert!(
+            notifications.is_empty(),
             "notifications don't match {notifications:?}"
         );
-        assert!(matches!(
-            &notifications[0].update,
-            SessionUpdate::AgentMessageChunk(ContentChunk {
-                content: ContentBlock::Text(TextContent { text, .. }),
-                ..
-            }) if text == "Undo in progress..."
-        ));
-        assert!(matches!(
-            &notifications[1].update,
-            SessionUpdate::AgentMessageChunk(ContentChunk {
-                content: ContentBlock::Text(TextContent { text, .. }),
-                ..
-            }) if text == "Undo completed."
-        ));
 
         let ops = thread.ops.lock().unwrap();
-        assert_eq!(ops.as_slice(), &[Op::Undo]);
+        assert_eq!(ops.as_slice(), &[Op::ThreadRollback { num_turns: 1 }]);
 
         Ok(())
     }
@@ -3609,7 +3654,9 @@ mod tests {
                     text: INIT_COMMAND_PROMPT.to_string(),
                     text_elements: vec![]
                 }],
+                environments: None,
                 final_output_json_schema: None,
+                responsesapi_client_metadata: None,
             }],
             "ops don't match {ops:?}"
         );
@@ -3901,7 +3948,7 @@ mod tests {
         let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
         let (resolution_tx, resolution_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let mut actor = ThreadActor::new(
+        let actor = ThreadActor::new(
             StubAuth,
             session_client,
             conversation.clone(),
@@ -3919,8 +3966,9 @@ mod tests {
 
     struct StubAuth;
 
+    #[async_trait::async_trait(?Send)]
     impl Auth for StubAuth {
-        fn logout(&self) -> Result<bool, Error> {
+        async fn logout(&self) -> Result<bool, Error> {
             Ok(true)
         }
     }
@@ -3995,8 +4043,9 @@ mod tests {
                             call_id: "call-a".into(),
                             process_id: None,
                             turn_id: turn_id.clone(),
+                            started_at_ms: 0,
                             command: vec!["echo".into(), "a".into()],
-                            cwd: cwd.clone(),
+                            cwd: cwd.clone().try_into().unwrap(),
                             parsed_cmd: vec![ParsedCommand::Unknown {
                                 cmd: "echo a".into(),
                             }],
@@ -4007,8 +4056,9 @@ mod tests {
                             call_id: "call-b".into(),
                             process_id: None,
                             turn_id: turn_id.clone(),
+                            started_at_ms: 0,
                             command: vec!["echo".into(), "b".into()],
-                            cwd: cwd.clone(),
+                            cwd: cwd.clone().try_into().unwrap(),
                             parsed_cmd: vec![ParsedCommand::Unknown {
                                 cmd: "echo b".into(),
                             }],
@@ -4019,8 +4069,9 @@ mod tests {
                             call_id: "call-a".into(),
                             process_id: None,
                             turn_id: turn_id.clone(),
+                            completed_at_ms: 0,
                             command: vec!["echo".into(), "a".into()],
-                            cwd: cwd.clone(),
+                            cwd: cwd.clone().try_into().unwrap(),
                             parsed_cmd: vec![],
                             source: Default::default(),
                             interaction_input: None,
@@ -4036,8 +4087,9 @@ mod tests {
                             call_id: "call-b".into(),
                             process_id: None,
                             turn_id: turn_id.clone(),
+                            completed_at_ms: 0,
                             command: vec!["echo".into(), "b".into()],
-                            cwd: cwd.clone(),
+                            cwd: cwd.clone().try_into().unwrap(),
                             parsed_cmd: vec![],
                             source: Default::default(),
                             interaction_input: None,
@@ -4052,6 +4104,9 @@ mod tests {
                         send(EventMsg::TurnComplete(TurnCompleteEvent {
                             last_agent_message: None,
                             turn_id,
+                            completed_at: None,
+                            duration_ms: None,
+                            time_to_first_token_ms: None,
                         }));
                     } else if prompt == "approval-block" {
                         self.op_tx
@@ -4061,8 +4116,9 @@ mod tests {
                                     call_id: "call-id".to_string(),
                                     approval_id: Some("approval-id".to_string()),
                                     turn_id: id.to_string(),
+                                    started_at_ms: 0,
                                     command: vec!["echo".to_string(), "hi".to_string()],
-                                    cwd: std::env::current_dir().unwrap(),
+                                    cwd: std::env::current_dir().unwrap().try_into().unwrap(),
                                     reason: None,
                                     network_approval_context: None,
                                     proposed_execpolicy_amendment: None,
@@ -4109,6 +4165,9 @@ mod tests {
                                 msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                     last_agent_message: None,
                                     turn_id: id.to_string(),
+                                    completed_at: None,
+                                    duration_ms: None,
+                                    time_to_first_token_ms: None,
                                 }),
                             })
                             .unwrap();
@@ -4122,6 +4181,7 @@ mod tests {
                                 model_context_window: None,
                                 collaboration_mode_kind: ModeKind::default(),
                                 turn_id: id.to_string(),
+                                started_at: None,
                             }),
                         })
                         .unwrap();
@@ -4141,29 +4201,19 @@ mod tests {
                             msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                 last_agent_message: None,
                                 turn_id: id.to_string(),
+                                completed_at: None,
+                                duration_ms: None,
+                                time_to_first_token_ms: None,
                             }),
                         })
                         .unwrap();
                 }
-                Op::Undo => {
+                Op::ThreadRollback { num_turns } => {
                     self.op_tx
                         .send(Event {
                             id: id.to_string(),
-                            msg: EventMsg::UndoStarted(
-                                codex_protocol::protocol::UndoStartedEvent {
-                                    message: Some("Undo in progress...".to_string()),
-                                },
-                            ),
-                        })
-                        .unwrap();
-                    self.op_tx
-                        .send(Event {
-                            id: id.to_string(),
-                            msg: EventMsg::UndoCompleted(
-                                codex_protocol::protocol::UndoCompletedEvent {
-                                    success: true,
-                                    message: Some("Undo completed.".to_string()),
-                                },
+                            msg: EventMsg::ThreadRolledBack(
+                                codex_protocol::protocol::ThreadRolledBackEvent { num_turns },
                             ),
                         })
                         .unwrap();
@@ -4173,6 +4223,9 @@ mod tests {
                             msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                 last_agent_message: None,
                                 turn_id: id.to_string(),
+                                completed_at: None,
+                                duration_ms: None,
+                                time_to_first_token_ms: None,
                             }),
                         })
                         .unwrap();
@@ -4206,6 +4259,9 @@ mod tests {
                             msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                 last_agent_message: None,
                                 turn_id: id.to_string(),
+                                completed_at: None,
+                                duration_ms: None,
+                                time_to_first_token_ms: None,
                             }),
                         })
                         .unwrap();
@@ -4223,6 +4279,8 @@ mod tests {
                                 msg: EventMsg::TurnAborted(TurnAbortedEvent {
                                     turn_id: Some(active_prompt_id),
                                     reason: codex_protocol::protocol::TurnAbortReason::Interrupted,
+                                    completed_at: None,
+                                    duration_ms: None,
                                 }),
                             })
                             .unwrap();
@@ -4310,7 +4368,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parallel_exec_commands() -> anyhow::Result<()> {
-        let (session_id, client, _, message_tx, local_set) = setup(vec![]).await?;
+        let (session_id, client, _, message_tx, local_set) = setup().await?;
         let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
 
         message_tx.send(ThreadMessage::Prompt {
@@ -4417,8 +4475,9 @@ mod tests {
                             call_id: "call-id".to_string(),
                             approval_id: Some("approval-id".to_string()),
                             turn_id: "turn-id".to_string(),
+                            started_at_ms: 0,
                             command: vec!["echo".to_string(), "hi".to_string()],
-                            cwd: std::env::current_dir()?,
+                            cwd: std::env::current_dir()?.try_into()?,
                             reason: None,
                             network_approval_context: None,
                             proposed_execpolicy_amendment: None,
@@ -4566,8 +4625,9 @@ mod tests {
                             call_id: "call-id".to_string(),
                             approval_id: Some("approval-id".to_string()),
                             turn_id: "turn-id".to_string(),
+                            started_at_ms: 0,
                             command: vec!["echo".to_string(), "hi".to_string()],
-                            cwd: std::env::current_dir()?,
+                            cwd: std::env::current_dir()?.try_into()?,
                             reason: None,
                             network_approval_context: None,
                             proposed_execpolicy_amendment: None,
