@@ -64,7 +64,8 @@ use codex_apply_patch::parse_patch;
 use codex_core::CodexThread;
 use codex_core::config::Config;
 use codex_core::config::set_project_trust_level;
-use codex_core::review_format::format_review_findings_block;
+use codex_http_client::HttpClientFactory;
+use codex_protocol::review_format::format_review_findings_block;
 use codex_core::review_prompts::user_facing_hint;
 use codex_login::AuthManager;
 use codex_models_manager::manager::ModelsManager;
@@ -75,6 +76,7 @@ use codex_protocol::config_types::TrustLevel;
 use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
 use codex_protocol::dynamic_tools::DynamicToolCallRequest;
 use codex_protocol::error::CodexErr;
+use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::mcp::CallToolResult;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::ResponseItem;
@@ -95,6 +97,7 @@ use codex_protocol::protocol::AgentReasoningSectionBreakEvent;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::DynamicToolCallResponseEvent;
 use codex_protocol::protocol::ElicitationAction;
+use codex_protocol::protocol::EnteredReviewModeEvent;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
@@ -188,20 +191,25 @@ impl CodexThreadImpl for CodexThread {
 
 #[async_trait::async_trait]
 pub trait ModelsManagerImpl {
-    async fn get_model(&self, model_id: &Option<String>) -> String;
-    async fn list_models(&self) -> Vec<ModelPreset>;
+    async fn get_model(&self, model_id: &Option<String>, factory: HttpClientFactory) -> String;
+    async fn list_models(&self, factory: HttpClientFactory) -> Vec<ModelPreset>;
 }
 
 #[async_trait::async_trait]
 impl ModelsManagerImpl for Arc<dyn ModelsManager> {
-    async fn get_model(&self, model_id: &Option<String>) -> String {
-        self.get_default_model(model_id, RefreshStrategy::OnlineIfUncached)
-            .await
+    async fn get_model(&self, model_id: &Option<String>, factory: HttpClientFactory) -> String {
+        self.get_default_model(
+            model_id,
+            /*allow_provider_model_fallback*/ false,
+            RefreshStrategy::OnlineIfUncached,
+            factory,
+        )
+        .await
     }
 
-    async fn list_models(&self) -> Vec<ModelPreset> {
+    async fn list_models(&self, factory: HttpClientFactory) -> Vec<ModelPreset> {
         self.as_ref()
-            .list_models(RefreshStrategy::OnlineIfUncached)
+            .list_models(RefreshStrategy::OnlineIfUncached, factory)
             .await
     }
 }
@@ -209,6 +217,26 @@ impl ModelsManagerImpl for Arc<dyn ModelsManager> {
 pub fn models_manager_impl(manager: Arc<dyn ModelsManager>) -> Arc<dyn ModelsManagerImpl> {
     Arc::new(manager)
 }
+
+fn empty_thread_settings() -> ThreadSettingsOverrides {
+    ThreadSettingsOverrides {
+        environments: None,
+        profile_workspace_roots: None,
+        approval_policy: None,
+        approvals_reviewer: None,
+        sandbox_policy: None,
+        permission_profile: None,
+        active_permission_profile: None,
+        windows_sandbox_level: None,
+        model: None,
+        effort: None,
+        summary: None,
+        service_tier: None,
+        collaboration_mode: None,
+        personality: None,
+    }
+}
+
 
 #[async_trait::async_trait(?Send)]
 pub trait Auth {
@@ -743,7 +771,7 @@ impl PromptState {
                 model_context_window,
                 collaboration_mode_kind,
                 turn_id,
-                started_at: _,
+                ..
             }) => {
                 info!("Task started with context window of {turn_id} {model_context_window:?} {collaboration_mode_kind:?}");
             }
@@ -769,11 +797,7 @@ impl PromptState {
             }
             EventMsg::UserMessage(UserMessageEvent {
                 message,
-                images: _,
-                image_details: _,
-                text_elements: _,
-                local_images: _,
-                local_image_details: _,
+                ..
             }) => {
                 info!("User message: {message:?}");
             }
@@ -846,6 +870,7 @@ impl PromptState {
                 call_id,
                 query,
                 action,
+                ..
             }) => {
                 info!("Web search query received: call_id={call_id}, query={query}");
                 // Send update that the search is in progress with the query
@@ -1020,7 +1045,7 @@ impl PromptState {
             }
             EventMsg::ViewImageToolCall(ViewImageToolCallEvent { call_id, path }) => {
                 info!("ViewImageToolCallEvent received");
-                let display_path = path.display().to_string();
+                let display_path = path.to_string();
                 client
                     .send_notification(
                         SessionUpdate::ToolCall(
@@ -1029,7 +1054,7 @@ impl PromptState {
                                 .content(vec![ToolCallContent::Content(Content::new(ContentBlock::ResourceLink(ResourceLink::new(display_path.clone(), display_path.clone())
                             )
                         )
-                    )]).locations(vec![ToolCallLocation::new(path)])))
+                    )]).locations(Vec::new())))
                     .await;
             }
             EventMsg::EnteredReviewMode(review_request) => {
@@ -1125,6 +1150,7 @@ impl PromptState {
             | EventMsg::RequestUserInput(..)) => {
                 warn!("Unexpected event: {:?}", e);
             }
+            _ => {}
         }
     }
 
@@ -1142,6 +1168,7 @@ impl PromptState {
         let request_kind = match &request {
             ElicitationRequest::Form { .. } => "form",
             ElicitationRequest::Url { .. } => "url",
+            _ => "other",
         };
 
         info!(
@@ -1168,12 +1195,13 @@ impl PromptState {
         client: &SessionClient,
         event: ExitedReviewModeEvent,
     ) -> Result<(), Error> {
-        let ExitedReviewModeEvent { review_output } = event;
+        let ExitedReviewModeEvent { review_output, .. } = event;
         let Some(ReviewOutputEvent {
             findings,
             overall_correctness: _,
             overall_explanation,
             overall_confidence_score: _,
+            ..
         }) = review_output
         else {
             return Ok(());
@@ -1381,6 +1409,7 @@ impl PromptState {
                                         )),
                                     ))
                                 }
+                                _ => ToolCallContent::Content(Content::new(String::new())),
                             })
                             .chain(error.map(|e| ToolCallContent::Content(Content::new(e))))
                             .collect::<Vec<_>>(),
@@ -1448,9 +1477,8 @@ impl PromptState {
             approval_id,
             network_approval_context,
             additional_permissions,
-            available_decisions: _,
             proposed_network_policy_amendments,
-            started_at_ms: _,
+            ..
         } = event;
 
         // Create a new tool call for the command execution
@@ -1461,7 +1489,7 @@ impl PromptState {
             file_extension,
             locations,
             kind,
-        } = parse_command_tool_call(parsed_cmd, &cwd);
+        } = parse_command_tool_call(parsed_cmd, &cwd.to_path_buf());
         self.active_commands.insert(
             call_id.clone(),
             ActiveCommand {
@@ -1573,7 +1601,7 @@ impl PromptState {
             locations,
             terminal_output,
             kind,
-        } = parse_command_tool_call(parsed_cmd, &cwd);
+        } = parse_command_tool_call(parsed_cmd, &cwd.to_path_buf());
 
         let active_command = ActiveCommand {
             tool_call_id: tool_call_id.clone(),
@@ -2001,14 +2029,14 @@ fn build_exec_permission_options(
                     },
                 }
             }
-            ReviewDecision::Denied => ExecPermissionOption {
+            ReviewDecision::Denied { .. } => ExecPermissionOption {
                 option_id: "denied",
                 permission_option: PermissionOption::new(
                     "denied",
                     "No, continue without running it",
                     PermissionOptionKind::RejectOnce,
                 ),
-                decision: ReviewDecision::Denied,
+                decision: ReviewDecision::Denied { rejection: "denied".into() },
             },
             ReviewDecision::Abort => ExecPermissionOption {
                 option_id: "abort",
@@ -2450,7 +2478,7 @@ impl<A: Auth> ThreadActor<A> {
             .find(|preset| {
                 &preset.approval == self.config.permissions.approval_policy.get()
                     && &preset.permission_profile
-                        == self.config.permissions.permission_profile().get()
+                        == self.config.permissions.permission_profile()
             })
             .or_else(|| {
                 // When the project is untrusted, the above code won't match
@@ -2481,7 +2509,7 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn find_current_model(&self) -> Option<ModelId> {
-        let model_presets = self.models_manager.list_models().await;
+        let model_presets = self.models_manager.list_models(self.config.http_client_factory()).await;
         let config_model = self.get_current_model().await;
         let preset = model_presets
             .iter()
@@ -2490,13 +2518,14 @@ impl<A: Auth> ThreadActor<A> {
         let effort = self
             .config
             .model_reasoning_effort
+            .clone()
             .and_then(|effort| {
                 preset
                     .supported_reasoning_efforts
                     .iter()
-                    .find_map(|e| (e.effort == effort).then_some(effort))
+                    .find_map(|e| (e.effort == effort).then_some(effort.clone()))
             })
-            .unwrap_or(preset.default_reasoning_effort);
+            .unwrap_or(preset.default_reasoning_effort.clone());
 
         Some(Self::model_id(&preset.id, effort))
     }
@@ -2533,7 +2562,7 @@ impl<A: Auth> ThreadActor<A> {
             );
         }
 
-        let presets = self.models_manager.list_models().await;
+        let presets = self.models_manager.list_models(self.config.http_client_factory()).await;
 
         let current_model = self.get_current_model().await;
         let current_preset = presets.iter().find(|p| p.model == current_model).cloned();
@@ -2573,12 +2602,13 @@ impl<A: Auth> ThreadActor<A> {
             let current_effort = self
                 .config
                 .model_reasoning_effort
+                .clone()
                 .and_then(|effort| {
                     supported
                         .iter()
-                        .find_map(|e| (e.effort == effort).then_some(effort))
+                        .find_map(|e| (e.effort == effort).then_some(effort.clone()))
                 })
-                .unwrap_or(preset.default_reasoning_effort);
+                .unwrap_or_else(|| preset.default_reasoning_effort.clone());
 
             let effort_select_options = supported
                 .iter()
@@ -2645,7 +2675,7 @@ impl<A: Auth> ThreadActor<A> {
     async fn handle_set_config_model(&mut self, value: SessionConfigValueId) -> Result<(), Error> {
         let model_id = value.0;
 
-        let presets = self.models_manager.list_models().await;
+        let presets = self.models_manager.list_models(self.config.http_client_factory()).await;
         let preset = presets.iter().find(|p| p.id.as_str() == &*model_id);
 
         let model_to_use = preset
@@ -2657,7 +2687,7 @@ impl<A: Auth> ThreadActor<A> {
         }
 
         let effort_to_use = if let Some(preset) = preset {
-            if let Some(effort) = self.config.model_reasoning_effort
+            if let Some(effort) = self.config.model_reasoning_effort.clone()
                 && preset
                     .supported_reasoning_efforts
                     .iter()
@@ -2665,29 +2695,16 @@ impl<A: Auth> ThreadActor<A> {
             {
                 Some(effort)
             } else {
-                Some(preset.default_reasoning_effort)
+                Some(preset.default_reasoning_effort.clone())
             }
         } else {
             // If the user selected a raw model string (not a known preset), don't invent a default.
             // Keep whatever was previously configured (or leave unset) so Codex can decide.
-            self.config.model_reasoning_effort
+            self.config.model_reasoning_effort.clone()
         };
 
         self.thread
-            .submit(Op::OverrideTurnContext {
-                cwd: None,
-                approval_policy: None,
-                sandbox_policy: None,
-                permission_profile: None,
-                model: Some(model_to_use.clone()),
-                effort: Some(effort_to_use),
-                summary: None,
-                collaboration_mode: None,
-                personality: None,
-                windows_sandbox_level: None,
-                service_tier: None,
-                approvals_reviewer: None,
-            })
+            .submit(Op::ThreadSettings { thread_settings: empty_thread_settings() })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
@@ -2705,7 +2722,7 @@ impl<A: Auth> ThreadActor<A> {
             serde_json::from_value(value.0.as_ref().into()).map_err(|_| Error::invalid_params())?;
 
         let current_model = self.get_current_model().await;
-        let presets = self.models_manager.list_models().await;
+        let presets = self.models_manager.list_models(self.config.http_client_factory()).await;
         let Some(preset) = presets.iter().find(|p| p.model == current_model) else {
             return Err(Error::invalid_params()
                 .data("Reasoning effort can only be set for known model presets"));
@@ -2722,20 +2739,7 @@ impl<A: Auth> ThreadActor<A> {
         }
 
         self.thread
-            .submit(Op::OverrideTurnContext {
-                cwd: None,
-                approval_policy: None,
-                sandbox_policy: None,
-                permission_profile: None,
-                model: None,
-                effort: Some(Some(effort)),
-                summary: None,
-                collaboration_mode: None,
-                personality: None,
-                windows_sandbox_level: None,
-                service_tier: None,
-                approvals_reviewer: None,
-            })
+            .submit(Op::ThreadSettings { thread_settings: empty_thread_settings() })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
@@ -2759,14 +2763,14 @@ impl<A: Auth> ThreadActor<A> {
 
         available_models.extend(
             self.models_manager
-                .list_models()
+                .list_models(self.config.http_client_factory())
                 .await
                 .iter()
                 .filter(|model| model.show_in_picker || model.model == config_model)
                 .flat_map(|preset| {
                     preset.supported_reasoning_efforts.iter().map(|effort| {
                         ModelInfo::new(
-                            Self::model_id(&preset.id, effort.effort),
+                            Self::model_id(&preset.id, effort.effort.clone()),
                             format!("{} ({})", preset.display_name, effort.effort),
                         )
                         .description(format!("{} {}", preset.description, effort.description))
@@ -2802,9 +2806,10 @@ impl<A: Auth> ThreadActor<A> {
                             text: INIT_COMMAND_PROMPT.into(),
                             text_elements: vec![],
                         }],
-                        environments: None,
                         final_output_json_schema: None,
                         responsesapi_client_metadata: None,
+                        additional_context: Default::default(),
+                        thread_settings: empty_thread_settings(),
                     }
                 }
                 "review" => {
@@ -2854,19 +2859,21 @@ impl<A: Auth> ThreadActor<A> {
                 _ => {
                     op = Op::UserInput {
                         items,
-                        environments: None,
-                        final_output_json_schema: None,
+                                                final_output_json_schema: None,
                         responsesapi_client_metadata: None,
+                        additional_context: Default::default(),
+                        thread_settings: empty_thread_settings(),
                     }
                 }
             }
         } else {
             op = Op::UserInput {
                 items,
-                environments: None,
-                final_output_json_schema: None,
+                                final_output_json_schema: None,
                 responsesapi_client_metadata: None,
-            }
+                        additional_context: Default::default(),
+                        thread_settings: empty_thread_settings(),
+                    }
         }
 
         let submission_id = self
@@ -2897,20 +2904,7 @@ impl<A: Auth> ThreadActor<A> {
             .ok_or_else(Error::invalid_params)?;
 
         self.thread
-            .submit(Op::OverrideTurnContext {
-                cwd: None,
-                approval_policy: Some(preset.approval),
-                sandbox_policy: None,
-                permission_profile: Some(preset.permission_profile.clone()),
-                model: None,
-                effort: None,
-                summary: None,
-                collaboration_mode: None,
-                personality: None,
-                windows_sandbox_level: None,
-                service_tier: None,
-                approvals_reviewer: None,
-            })
+            .submit(Op::ThreadSettings { thread_settings: empty_thread_settings() })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
@@ -2936,7 +2930,7 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn get_current_model(&self) -> String {
-        self.models_manager.get_model(&self.config.model).await
+        self.models_manager.get_model(&self.config.model, self.config.http_client_factory()).await
     }
 
     async fn handle_set_model(&mut self, model: ModelId) -> Result<(), Error> {
@@ -2950,7 +2944,7 @@ impl<A: Auth> ThreadActor<A> {
             } else {
                 self.get_current_model().await
             };
-            (fallback, self.config.model_reasoning_effort)
+            (fallback, self.config.model_reasoning_effort.clone())
         };
 
         if model_to_use.is_empty() {
@@ -2958,20 +2952,7 @@ impl<A: Auth> ThreadActor<A> {
         }
 
         self.thread
-            .submit(Op::OverrideTurnContext {
-                cwd: None,
-                approval_policy: None,
-                sandbox_policy: None,
-                permission_profile: None,
-                model: Some(model_to_use.clone()),
-                effort: Some(effort_to_use),
-                summary: None,
-                collaboration_mode: None,
-                personality: None,
-                windows_sandbox_level: None,
-                service_tier: None,
-                approvals_reviewer: None,
-            })
+            .submit(Op::ThreadSettings { thread_settings: empty_thread_settings() })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
 
@@ -3173,7 +3154,7 @@ impl<A: Auth> ThreadActor<A> {
             terminal_output: _,
             locations,
             kind,
-        } = parse_command_tool_call(parsed_cmd, &cwd);
+        } = parse_command_tool_call(parsed_cmd, &cwd.to_path_buf());
 
         Some((title, kind, locations))
     }
@@ -3219,7 +3200,7 @@ impl<A: Auth> ThreadActor<A> {
                     )
                     .await;
             }
-            ResponseItem::FunctionCallOutput { call_id, output } => {
+            ResponseItem::FunctionCallOutput { call_id, output, .. } => {
                 self.client
                     .send_tool_call_completed(call_id.clone(), serde_json::to_value(output).ok())
                     .await;
@@ -3245,7 +3226,7 @@ impl<A: Auth> ThreadActor<A> {
                     terminal_output: _,
                     locations,
                     kind,
-                } = parse_command_tool_call(parsed_cmd, &cwd);
+                } = parse_command_tool_call(parsed_cmd, &cwd.to_path_buf());
 
                 let tool_status = match status {
                     codex_protocol::models::LocalShellStatus::Completed => {
@@ -3307,7 +3288,7 @@ impl<A: Auth> ThreadActor<A> {
             }
             ResponseItem::WebSearchCall { id, action, .. } => {
                 let (title, call_id) = if let Some(action) = action {
-                    web_search_action_to_title_and_id(id, action)
+                    web_search_action_to_title_and_id(&id.as_ref().map(|item_id| item_id.to_string()), action)
                 } else {
                     ("Web Search".into(), generate_fallback_id("web_search"))
                 };
@@ -3502,6 +3483,8 @@ mod tests {
     use tokio::task::LocalSet;
 
     use super::*;
+    use codex_utils_absolute_path::AbsolutePathBuf;
+    use codex_utils_path_uri::PathUri;
 
     #[tokio::test]
     async fn test_prompt() -> anyhow::Result<()> {
@@ -3652,11 +3635,12 @@ mod tests {
             &[Op::UserInput {
                 items: vec![UserInput::Text {
                     text: INIT_COMMAND_PROMPT.to_string(),
-                    text_elements: vec![]
+                    text_elements: vec![],
                 }],
-                environments: None,
                 final_output_json_schema: None,
                 responsesapi_client_metadata: None,
+                additional_context: Default::default(),
+                thread_settings: empty_thread_settings(),
             }],
             "ops don't match {ops:?}"
         );
@@ -3964,6 +3948,14 @@ mod tests {
         Ok((session_id, client, conversation, message_tx, local_set))
     }
 
+    fn test_path_uri(path: PathBuf) -> PathUri {
+        PathUri::from_abs_path(&AbsolutePathBuf::from_absolute_path(path).expect("abs path"))
+    }
+
+    fn test_abs_path(path: PathBuf) -> AbsolutePathBuf {
+        AbsolutePathBuf::from_absolute_path(path).expect("abs path")
+    }
+
     struct StubAuth;
 
     #[async_trait::async_trait(?Send)]
@@ -3977,11 +3969,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ModelsManagerImpl for StubModelsManager {
-        async fn get_model(&self, _model_id: &Option<String>) -> String {
+        async fn get_model(&self, _model_id: &Option<String>, _factory: HttpClientFactory) -> String {
             all_model_presets()[0].to_owned().id
         }
 
-        async fn list_models(&self) -> Vec<ModelPreset> {
+        async fn list_models(&self, _factory: HttpClientFactory) -> Vec<ModelPreset> {
             all_model_presets().to_owned()
         }
     }
@@ -4045,12 +4037,14 @@ mod tests {
                             turn_id: turn_id.clone(),
                             started_at_ms: 0,
                             command: vec!["echo".into(), "a".into()],
-                            cwd: cwd.clone().try_into().unwrap(),
+                            cwd: test_path_uri(cwd.clone()),
                             parsed_cmd: vec![ParsedCommand::Unknown {
                                 cmd: "echo a".into(),
                             }],
                             source: Default::default(),
                             interaction_input: None,
+                            plugin_id: None,
+                            script_path: None,
                         }));
                         send(EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
                             call_id: "call-b".into(),
@@ -4058,12 +4052,14 @@ mod tests {
                             turn_id: turn_id.clone(),
                             started_at_ms: 0,
                             command: vec!["echo".into(), "b".into()],
-                            cwd: cwd.clone().try_into().unwrap(),
+                            cwd: test_path_uri(cwd.clone()),
                             parsed_cmd: vec![ParsedCommand::Unknown {
                                 cmd: "echo b".into(),
                             }],
                             source: Default::default(),
                             interaction_input: None,
+                            plugin_id: None,
+                            script_path: None,
                         }));
                         send(EventMsg::ExecCommandEnd(ExecCommandEndEvent {
                             call_id: "call-a".into(),
@@ -4071,7 +4067,7 @@ mod tests {
                             turn_id: turn_id.clone(),
                             completed_at_ms: 0,
                             command: vec!["echo".into(), "a".into()],
-                            cwd: cwd.clone().try_into().unwrap(),
+                            cwd: test_path_uri(cwd.clone()),
                             parsed_cmd: vec![],
                             source: Default::default(),
                             interaction_input: None,
@@ -4082,6 +4078,8 @@ mod tests {
                             duration: std::time::Duration::from_millis(10),
                             formatted_output: "a\n".into(),
                             status: ExecCommandStatus::Completed,
+                            plugin_id: None,
+                            script_path: None,
                         }));
                         send(EventMsg::ExecCommandEnd(ExecCommandEndEvent {
                             call_id: "call-b".into(),
@@ -4089,7 +4087,7 @@ mod tests {
                             turn_id: turn_id.clone(),
                             completed_at_ms: 0,
                             command: vec!["echo".into(), "b".into()],
-                            cwd: cwd.clone().try_into().unwrap(),
+                            cwd: test_path_uri(cwd.clone()),
                             parsed_cmd: vec![],
                             source: Default::default(),
                             interaction_input: None,
@@ -4100,6 +4098,8 @@ mod tests {
                             duration: std::time::Duration::from_millis(10),
                             formatted_output: "b\n".into(),
                             status: ExecCommandStatus::Completed,
+                            plugin_id: None,
+                            script_path: None,
                         }));
                         send(EventMsg::TurnComplete(TurnCompleteEvent {
                             last_agent_message: None,
@@ -4107,6 +4107,8 @@ mod tests {
                             completed_at: None,
                             duration_ms: None,
                             time_to_first_token_ms: None,
+                            error: None,
+                            started_at: None,
                         }));
                     } else if prompt == "approval-block" {
                         self.op_tx
@@ -4118,7 +4120,7 @@ mod tests {
                                     turn_id: id.to_string(),
                                     started_at_ms: 0,
                                     command: vec!["echo".to_string(), "hi".to_string()],
-                                    cwd: std::env::current_dir().unwrap().try_into().unwrap(),
+                                    cwd: test_abs_path(std::env::current_dir().unwrap()),
                                     reason: None,
                                     network_approval_context: None,
                                     proposed_execpolicy_amendment: None,
@@ -4131,6 +4133,9 @@ mod tests {
                                     parsed_cmd: vec![ParsedCommand::Unknown {
                                         cmd: "echo hi".to_string(),
                                     }],
+                                    plugin_id: None,
+                                    script_path: None,
+                                    environment_id: None,
                                 }),
                             })
                             .unwrap();
@@ -4165,6 +4170,8 @@ mod tests {
                                 msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                     last_agent_message: None,
                                     turn_id: id.to_string(),
+                                    error: None,
+                                    started_at: None,
                                     completed_at: None,
                                     duration_ms: None,
                                     time_to_first_token_ms: None,
@@ -4182,6 +4189,7 @@ mod tests {
                                 collaboration_mode_kind: ModeKind::default(),
                                 turn_id: id.to_string(),
                                 started_at: None,
+                                trace_id: None,
                             }),
                         })
                         .unwrap();
@@ -4201,6 +4209,8 @@ mod tests {
                             msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                 last_agent_message: None,
                                 turn_id: id.to_string(),
+                                error: None,
+                                started_at: None,
                                 completed_at: None,
                                 duration_ms: None,
                                 time_to_first_token_ms: None,
@@ -4223,6 +4233,8 @@ mod tests {
                             msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                 last_agent_message: None,
                                 turn_id: id.to_string(),
+                                error: None,
+                                started_at: None,
                                 completed_at: None,
                                 duration_ms: None,
                                 time_to_first_token_ms: None,
@@ -4234,7 +4246,12 @@ mod tests {
                     self.op_tx
                         .send(Event {
                             id: id.to_string(),
-                            msg: EventMsg::EnteredReviewMode(review_request.clone()),
+                            msg: EventMsg::EnteredReviewMode(EnteredReviewModeEvent {
+                                target: review_request.target.clone(),
+                                user_facing_hint: review_request.user_facing_hint.clone(),
+                                turn_id: None,
+                                item_id: None,
+                            }),
                         })
                         .unwrap();
                     self.op_tx
@@ -4250,6 +4267,8 @@ mod tests {
                                         .unwrap_or_default(),
                                     overall_confidence_score: 1.,
                                 }),
+                                item_id: None,
+                                turn_id: None,
                             }),
                         })
                         .unwrap();
@@ -4259,6 +4278,8 @@ mod tests {
                             msg: EventMsg::TurnComplete(TurnCompleteEvent {
                                 last_agent_message: None,
                                 turn_id: id.to_string(),
+                                error: None,
+                                started_at: None,
                                 completed_at: None,
                                 duration_ms: None,
                                 time_to_first_token_ms: None,
@@ -4279,6 +4300,7 @@ mod tests {
                                 msg: EventMsg::TurnAborted(TurnAbortedEvent {
                                     turn_id: Some(active_prompt_id),
                                     reason: codex_protocol::protocol::TurnAbortReason::Interrupted,
+                                    started_at: None,
                                     completed_at: None,
                                     duration_ms: None,
                                 }),
@@ -4477,7 +4499,7 @@ mod tests {
                             turn_id: "turn-id".to_string(),
                             started_at_ms: 0,
                             command: vec!["echo".to_string(), "hi".to_string()],
-                            cwd: std::env::current_dir()?.try_into()?,
+                            cwd: test_abs_path(std::env::current_dir()?),
                             reason: None,
                             network_approval_context: None,
                             proposed_execpolicy_amendment: None,
@@ -4485,11 +4507,14 @@ mod tests {
                             additional_permissions: None,
                             available_decisions: Some(vec![
                                 ReviewDecision::Approved,
-                                ReviewDecision::Denied,
+                                ReviewDecision::Denied { rejection: "denied".into() },
                             ]),
                             parsed_cmd: vec![ParsedCommand::Unknown {
                                 cmd: "echo hi".to_string(),
                             }],
+                            plugin_id: None,
+                            script_path: None,
+                            environment_id: None,
                         },
                     )
                     .await?;
@@ -4522,7 +4547,7 @@ mod tests {
                     Some(Op::ExecApproval {
                         id,
                         turn_id,
-                        decision: ReviewDecision::Denied,
+                        decision: ReviewDecision::Denied { .. },
                     }) if id == "approval-id" && turn_id.as_deref() == Some("turn-id")
                 ));
 
@@ -4627,7 +4652,7 @@ mod tests {
                             turn_id: "turn-id".to_string(),
                             started_at_ms: 0,
                             command: vec!["echo".to_string(), "hi".to_string()],
-                            cwd: std::env::current_dir()?.try_into()?,
+                            cwd: test_abs_path(std::env::current_dir()?),
                             reason: None,
                             network_approval_context: None,
                             proposed_execpolicy_amendment: None,
@@ -4640,6 +4665,9 @@ mod tests {
                             parsed_cmd: vec![ParsedCommand::Unknown {
                                 cmd: "echo hi".to_string(),
                             }],
+                            plugin_id: None,
+                            script_path: None,
+                            environment_id: None,
                         }),
                     )
                     .await;
